@@ -11,7 +11,7 @@
 //! p50/p95/p99 over a fixed sample window, raw samples kept in the JSON.
 //!
 //! Usage:
-//!   cargo run --release -p harness -- [--backend shapes|sprites]
+//!   cargo run --release -p benchmarks -- [--backend shapes|sprites]
 //!       [--elements N] [--frames N] [--warmup N] [--out DIR] [--label NAME]
 
 use std::collections::BTreeMap;
@@ -59,7 +59,7 @@ fn parse_args() -> BenchConfig {
     let mut elements = 200u32;
     let mut warmup = 120u32;
     let mut frames = 600u32;
-    let mut out_dir = PathBuf::from("results");
+    let mut out_dir = PathBuf::from("benchmarks/results");
     let mut label = None;
 
     let mut args = std::env::args().skip(1);

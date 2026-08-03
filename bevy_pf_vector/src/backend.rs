@@ -1,5 +1,5 @@
-//! The seam. Both the tessellated path and the native-interop path implement
-//! this, so they can be swapped at runtime and benchmarked in the same loop.
+//! The seam. Engine iterations implement this so alternative implementations
+//! can be swapped at runtime and benchmarked head-to-head in the same loop.
 
 use bevy::prelude::*;
 use bevy::render::render_resource::{CommandEncoder, TextureView};
@@ -9,8 +9,7 @@ use bevy::render::render_resource::{CommandEncoder, TextureView};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GeometryId(pub u32);
 
-/// Path outline in the usual verb form. Mirrors what lyon/kurbo consume on the
-/// tessellated path and what a rive factory would consume on the native path.
+/// Path outline in the usual verb form, matching what lyon/kurbo consume.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PathCommand {
     MoveTo(Vec2),
@@ -48,9 +47,9 @@ pub enum LineCap {
     Square,
 }
 
-/// What a backend records into. The tessellated path records passes on Bevy's
-/// encoder; the native path ignores it and submits on the shared queue itself
-/// (see [`VectorBackend::owns_submission`]).
+/// What a backend records into: Bevy's command encoder for the frame. The
+/// finished buffer is handed to `PendingCommandBuffers` before the render
+/// graph's Submit set runs.
 pub struct BackendEncoder<'a> {
     pub encoder: &'a mut CommandEncoder,
 }
@@ -87,8 +86,4 @@ pub trait VectorBackend: Send + Sync + 'static {
 
     /// Record draw work for one frame. Must not block on GPU.
     fn record(&mut self, scene: &FrameScene, encoder: &mut BackendEncoder<'_>);
-
-    /// True if this backend needs an external queue submit outside Bevy's
-    /// encoder (the native-interop path does; the tessellated path does not).
-    fn owns_submission(&self) -> bool { false }
 }

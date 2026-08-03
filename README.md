@@ -1,46 +1,52 @@
 # bevy_pf_vector
 
-Vector/UI rendering for `bevy_pf`. The crate scaffold compiles against Bevy
-0.19 and the benchmark harness (ARCHITECTURE.md §5) is built and validated;
-the renderer itself is not started.
+An original vector/UI rendering engine for `bevy_pf`, targeting Bevy 0.19.
 
-Read `ARCHITECTURE.md` first, especially:
+One narrow bet: game HUD content has mostly-static topology, so paths are
+tessellated once at asset load (lyon) and redrawn as GPU-instanced geometry —
+skipping the per-frame path processing that general-purpose engines
+(Skia, Vello, Rive) are structurally unable to skip. "Better" is defined as
+winning the benchmark suite in `benchmarks/` on frame-time and GPU-time
+percentiles, not asserted.
 
-- **§1** what this can and cannot realistically outperform
-- **§2** why there is no pure-wgpu path to the Rive Renderer's fast path
-- **§5** why the benchmark harness gets built before the renderer
+The engine crate is pure: no third-party renderer bindings. Competing
+renderers exist in this repo only as benchmark opponents, quarantined under
+`benchmarks/`.
+
+Read `ARCHITECTURE.md` first — especially §1 (what "better" can honestly
+mean) and §5 (why the benchmark harness was built before the renderer).
 
 ## Layout
 
-    bevy_pf_vector/     the crate
-    harness/            benchmark harness (ARCHITECTURE.md §4-5)
-    vendor-upstream.sh  pins upstream renderers as submodules under vendor/
+    bevy_pf_vector/     the engine crate (pure — bevy + lyon/kurbo only)
+    benchmarks/         harness, results, and vendor pins for opponents
     ARCHITECTURE.md     scope, design, benchmark plan
 
-## Running the harness
+A sibling project, `../bevy_pf_vector_testbed`, is the integration proving
+ground: a Bevy app consuming this crate as a path dependency.
 
-    cargo run --release -p harness -- --backend shapes --elements 200
-    cargo run --release -p harness -- --backend sprites --elements 200
+## Running the benchmarks
+
+    cargo run --release -p benchmarks -- --backend shapes --elements 200
+    cargo run --release -p benchmarks -- --backend sprites --elements 200
 
 Flags: `--backend shapes|sprites`, `--elements N` (default 200), `--frames N`
 (default 600), `--warmup N` (default 120), `--out DIR`, `--label NAME`.
 Prints p50/p95/p99 for CPU frame time and every `render/*` diagnostic
 (per-pass GPU time via timestamp queries, pipeline statistics), and writes
-JSON with raw samples to `results/`. Requires an adapter with
+JSON with raw samples to `benchmarks/results/`. Requires an adapter with
 `TIMESTAMP_QUERY` + `PIPELINE_STATISTICS_QUERY` (desktop Vulkan/DX12).
 
-The `sprites` backend exists to prove the harness can separate two backends
-known to differ: at 200 elements the distributions are non-overlapping
-(shapes ~0.023 ms vs sprites ~0.014 ms GPU in the 2D main pass on an RTX
-A6000), with identical vertex/primitive counts confirming equal draw load.
+Harness validity was established before any engine work: at 200 elements the
+`shapes` and `sprites` backends produce non-overlapping GPU-time
+distributions (~0.023 ms vs ~0.014 ms on an RTX A6000) with identical
+vertex/primitive counts, and a 200 → 5000 element sweep scales GPU time 38x.
+The current bar to beat for workload 1 is the `shapes` control:
+**~0.023 ms GPU / 200 elements**.
 
-## Vendoring upstream
+Vendoring benchmark opponents (optional, from Git Bash):
 
-Run from the repo root in Git Bash (not PowerShell — it's a bash script):
-
-    ./vendor-upstream.sh
-
-Skia is commented out; it's ~1.5 GB and only needed as reference.
+    ./benchmarks/vendor-upstream.sh
 
 ## License
 

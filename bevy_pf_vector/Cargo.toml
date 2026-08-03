@@ -4,17 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-[features]
-default = ["tessellated"]
-# Path C: tessellate once with lyon, instance on GPU. Portable, no interlock.
-tessellated = ["dep:lyon", "dep:kurbo"]
-# Path A: share Bevy's native device with rive-runtime's RenderContext.
-rive-native = ["dep:wgpu-hal", "dep:ash"]
-
 [dependencies]
 bevy = { version = "0.19", default-features = false, features = ["bevy_render", "bevy_asset", "bevy_color"] }
-lyon = { version = "1", optional = true }
-kurbo = { version = "0.11", optional = true }
-# Must track the wgpu major that bevy 0.19 ships (wgpu 29), or as_hal() types won't line up.
-wgpu-hal = { version = "29", optional = true }
-ash = { version = "0.38", optional = true }
+# Tessellation at asset load; instancing on the GPU every frame after.
+lyon = "1"
+kurbo = "0.11"

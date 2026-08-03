@@ -1,6 +1,14 @@
 # bevy_pf_vector — scope, architecture, and what is actually achievable
 
-Status: design scaffold. Nothing here has been compiled or benchmarked.
+Status: benchmark harness built and validated; engine implementation next.
+
+> **Update 2026-08-03:** by project decision the engine is pure — path A
+> (native rive interop) was removed from the codebase entirely. §2's
+> constraint analysis and the path table are kept below as the historical
+> record of why the design space looks the way it does. Competing renderers
+> exist in this repo only as benchmark opponents under `benchmarks/vendor/`.
+> Bevy 0.19 also replaced the Node-based render graph with a schedule
+> (`RenderGraph` is a `ScheduleLabel`); node.rs documents the new idiom.
 
 ## 1. Scope correction, stated plainly
 
@@ -51,22 +59,23 @@ tessellate-once-and-instance pipeline sidesteps that entirely. This is also what
 `bevy_vector_shapes` does for SDF primitives, but it does not handle arbitrary
 paths or `.riv` state machines.
 
-Recommended sequencing: **C first** (ships, portable, measurable), **A second**
-(for the cases C cannot cover — dynamic strokes, feathering, heavy clipping),
-**B never** unless you decide to own a rasterizer as a product in itself.
+Sequencing after the 2026-08-03 purity decision: **C is the engine** (ships,
+portable, measurable). **A is removed** — the cases it would have covered
+(dynamic strokes, feathering, heavy clipping) must be won by extending C or
+conceded and kept out of scope, decided per-workload by benchmark evidence.
+**B never**, unless you decide to own a rasterizer as a product in itself.
 
 ## 3. Crate shape
 
     bevy_pf_vector/
       src/
-        lib.rs        plugin registration, asset types
-        backend.rs    VectorBackend trait — the seam between C and A
-        node.rs       render graph node + explicit barriers
-        ffi.rs        rive-runtime C ABI surface (path A only)
+        lib.rs        plugin registration, VectorShape authoring component
+        backend.rs    VectorBackend trait — the seam engine iterations implement
+        node.rs       vector_pass system for the 0.19 RenderGraph schedule
 
 The `VectorBackend` trait is the important artifact. If it is drawn correctly,
-path C and path A are swappable at runtime and benchmarkable head-to-head in the
-same frame loop. If it is drawn wrong, you will rewrite the plugin when A lands.
+alternative engine implementations are swappable at runtime and benchmarkable
+head-to-head in the same frame loop.
 
 ## 4. Benchmark plan — write this before the renderer
 

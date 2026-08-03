@@ -1,37 +1,34 @@
-//! bevy_pf_vector — vector/UI rendering for bevy_pf.
+//! bevy_pf_vector — a vector/UI rendering engine for bevy_pf.
 //!
-//! Read ARCHITECTURE.md before extending this. In particular §1 (what this can
-//! and cannot beat) and §2 (why there is no pure-wgpu path to Rive's fast path).
+//! Original engine, one narrow bet: HUD content has mostly-static topology,
+//! so paths are tessellated once (lyon) and redrawn as GPU-instanced geometry.
+//! Read ARCHITECTURE.md before extending this.
 
 pub mod backend;
 pub mod node;
-#[cfg(feature = "rive-native")]
-pub mod ffi;
 
 use bevy::prelude::*;
 
-pub struct PfVectorPlugin {
-    pub backend: BackendChoice,
+pub use backend::{
+    GeometryId, LineCap, LineJoin, PathCommand, PathStyle, StrokeStyle, VectorBackend,
+};
+
+/// A vector shape authored as a path outline plus style. Topology is treated
+/// as static: the path is tessellated once when the component is added; only
+/// `Transform` and style parameters are expected to change per frame.
+#[derive(Component, Clone, Debug)]
+pub struct VectorShape {
+    pub commands: Vec<PathCommand>,
+    pub style: PathStyle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BackendChoice {
-    /// Path C — tessellate once, instance. Portable. Start here.
-    Tessellated,
-    /// Path A — share the native device with rive-runtime. Desktop only.
-    RiveNative,
-}
-
-impl Default for PfVectorPlugin {
-    fn default() -> Self {
-        Self { backend: BackendChoice::Tessellated }
-    }
-}
+pub struct PfVectorPlugin;
 
 impl Plugin for PfVectorPlugin {
     fn build(&self, _app: &mut App) {
-        // TODO: register assets, add node::vector_pass to the RenderGraph
-        // schedule (RenderGraphSystems::Render, after camera_driver), install
-        // the selected backend as a render-world resource.
+        // TODO(engine): extract VectorShape entities to the render world,
+        // tessellate on first sight (upload_geometry), and add
+        // node::vector_pass to the RenderGraph schedule
+        // (RenderGraphSystems::Render, after camera_driver).
     }
 }
