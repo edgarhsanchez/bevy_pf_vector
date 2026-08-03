@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["bevy_pf_vector", "harness"]
+
+# Bevy is unusably slow at opt-level 0; benchmarks must use --release regardless.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

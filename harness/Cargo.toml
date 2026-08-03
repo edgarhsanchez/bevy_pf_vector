@@ -1,0 +1,11 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# "2d" pulls default_app + default_platform + the 2D render stack — winit,
+# multi_threaded, core pipeline, sprites — without audio/gltf/pbr.
+bevy = { version = "0.19", default-features = false, features = ["2d"] }
+bevy_vector_shapes = "0.13.1"
