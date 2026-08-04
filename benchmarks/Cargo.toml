@@ -9,3 +9,4 @@ publish = false
 # multi_threaded, core pipeline, sprites — without audio/gltf/pbr.
 bevy = { version = "0.19", default-features = false, features = ["2d"] }
 bevy_vector_shapes = "0.13.1"
+bevy_pf_vector = { path = "../bevy_pf_vector" }

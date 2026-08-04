@@ -6,6 +6,8 @@
 
 pub mod backend;
 pub mod node;
+pub mod render;
+pub mod tess;
 
 use bevy::prelude::*;
 
@@ -17,6 +19,7 @@ pub use backend::{
 /// as static: the path is tessellated once when the component is added; only
 /// `Transform` and style parameters are expected to change per frame.
 #[derive(Component, Clone, Debug)]
+#[require(Transform)]
 pub struct VectorShape {
     pub commands: Vec<PathCommand>,
     pub style: PathStyle,
@@ -25,10 +28,7 @@ pub struct VectorShape {
 pub struct PfVectorPlugin;
 
 impl Plugin for PfVectorPlugin {
-    fn build(&self, _app: &mut App) {
-        // TODO(engine): extract VectorShape entities to the render world,
-        // tessellate on first sight (upload_geometry), and add
-        // node::vector_pass to the RenderGraph schedule
-        // (RenderGraphSystems::Render, after camera_driver).
+    fn build(&self, app: &mut App) {
+        app.add_plugins(render::VectorRenderPlugin);
     }
 }

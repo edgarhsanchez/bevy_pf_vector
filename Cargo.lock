@@ -332,6 +332,7 @@ name = "benchmarks"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bevy_pf_vector",
  "bevy_vector_shapes",
 ]
 
@@ -1135,6 +1136,7 @@ name = "bevy_pf_vector"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "bytemuck",
  "kurbo",
  "lyon",
 ]

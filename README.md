@@ -41,8 +41,20 @@ Harness validity was established before any engine work: at 200 elements the
 `shapes` and `sprites` backends produce non-overlapping GPU-time
 distributions (~0.023 ms vs ~0.014 ms on an RTX A6000) with identical
 vertex/primitive counts, and a 200 → 5000 element sweep scales GPU time 38x.
-The current bar to beat for workload 1 is the `shapes` control:
-**~0.023 ms GPU / 200 elements**.
+
+## Workload 1 results (RTX A6000, Vulkan — p50 over 600 frames)
+
+| backend | 200 el GPU | 5000 el GPU | 5000 el CPU frame | 5000 el fragment inv. |
+|---|---|---|---|---|
+| shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | 3.73 ms | 32.3 M |
+| **engine (`--backend engine`)** | **0.0174 ms** | **0.324 ms** | **1.66 ms** | **7.8 M** |
+
+The engine wins by structure, not tuning: exact-coverage tessellated
+triangles shade ~4x fewer fragments than SDF bounding quads, opaque HUD
+content renders with early-z depth testing instead of blending, and
+instances are 36 bytes. Measured on NVIDIA/Vulkan only so far — AMD, Intel,
+and Apple/Metal numbers are pending hardware access, and every technique
+used is portable wgpu (no vendor extensions).
 
 Vendoring benchmark opponents (optional, from Git Bash):
 

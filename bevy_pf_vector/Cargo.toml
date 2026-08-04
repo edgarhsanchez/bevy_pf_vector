@@ -5,7 +5,8 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-bevy = { version = "0.19", default-features = false, features = ["bevy_render", "bevy_asset", "bevy_color"] }
+bevy = { version = "0.19", default-features = false, features = ["bevy_render", "bevy_asset", "bevy_color", "bevy_core_pipeline"] }
 # Tessellation at asset load; instancing on the GPU every frame after.
 lyon = "1"
 kurbo = "0.11"
+bytemuck = { version = "1", features = ["derive"] }

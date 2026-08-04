@@ -33,6 +33,7 @@ use bevy_vector_shapes::prelude::*;
 enum Backend {
     Shapes,
     Sprites,
+    Engine,
 }
 
 impl Backend {
@@ -40,6 +41,7 @@ impl Backend {
         match self {
             Backend::Shapes => "shapes",
             Backend::Sprites => "sprites",
+            Backend::Engine => "engine",
         }
     }
 }
@@ -73,7 +75,8 @@ fn parse_args() -> BenchConfig {
                 backend = match value().as_str() {
                     "shapes" => Backend::Shapes,
                     "sprites" => Backend::Sprites,
-                    other => panic!("unknown backend '{other}' (shapes|sprites)"),
+                    "engine" => Backend::Engine,
+                    other => panic!("unknown backend '{other}' (shapes|sprites|engine)"),
                 }
             }
             "--elements" => elements = value().parse().expect("--elements"),
@@ -265,6 +268,148 @@ fn setup_sprites(mut commands: Commands, cfg: Res<BenchConfig>) {
             transform,
             anim,
         ));
+    }
+}
+
+/// Workload 1 authored through the engine's own API. Consumes the rng in
+/// exactly the same order as `setup_shapes`, so layout, sizes, colors, and
+/// kinds are identical to the control — sizes are baked into path
+/// coordinates instead of transform scale so tessellation density is right.
+fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
+    use bevy_pf_vector::{LineCap, LineJoin, PathCommand, PathStyle, StrokeStyle, VectorShape};
+
+    fn fill(color: LinearRgba) -> PathStyle {
+        PathStyle { fill: Some(color), stroke: None }
+    }
+    fn stroke(color: LinearRgba, width: f32) -> PathStyle {
+        PathStyle {
+            fill: None,
+            stroke: Some(StrokeStyle {
+                color,
+                width,
+                join: LineJoin::Round,
+                cap: LineCap::Round,
+            }),
+        }
+    }
+    /// Circle as four cubic Béziers (k = 0.5522847).
+    fn circle_path(r: f32) -> Vec<PathCommand> {
+        let k = 0.552_284_75 * r;
+        vec![
+            PathCommand::MoveTo(Vec2::new(r, 0.0)),
+            PathCommand::CubicTo {
+                ctrl1: Vec2::new(r, k),
+                ctrl2: Vec2::new(k, r),
+                to: Vec2::new(0.0, r),
+            },
+            PathCommand::CubicTo {
+                ctrl1: Vec2::new(-k, r),
+                ctrl2: Vec2::new(-r, k),
+                to: Vec2::new(-r, 0.0),
+            },
+            PathCommand::CubicTo {
+                ctrl1: Vec2::new(-r, -k),
+                ctrl2: Vec2::new(-k, -r),
+                to: Vec2::new(0.0, -r),
+            },
+            PathCommand::CubicTo {
+                ctrl1: Vec2::new(k, -r),
+                ctrl2: Vec2::new(r, -k),
+                to: Vec2::new(r, 0.0),
+            },
+            PathCommand::Close,
+        ]
+    }
+    fn rounded_rect_path(w: f32, h: f32, r: f32) -> Vec<PathCommand> {
+        let (hw, hh) = (w / 2.0, h / 2.0);
+        let r = r.min(hw).min(hh);
+        if r <= 0.0 {
+            return vec![
+                PathCommand::MoveTo(Vec2::new(-hw, hh)),
+                PathCommand::LineTo(Vec2::new(hw, hh)),
+                PathCommand::LineTo(Vec2::new(hw, -hh)),
+                PathCommand::LineTo(Vec2::new(-hw, -hh)),
+                PathCommand::Close,
+            ];
+        }
+        vec![
+            PathCommand::MoveTo(Vec2::new(-hw + r, hh)),
+            PathCommand::LineTo(Vec2::new(hw - r, hh)),
+            PathCommand::QuadTo { ctrl: Vec2::new(hw, hh), to: Vec2::new(hw, hh - r) },
+            PathCommand::LineTo(Vec2::new(hw, -hh + r)),
+            PathCommand::QuadTo { ctrl: Vec2::new(hw, -hh), to: Vec2::new(hw - r, -hh) },
+            PathCommand::LineTo(Vec2::new(-hw + r, -hh)),
+            PathCommand::QuadTo { ctrl: Vec2::new(-hw, -hh), to: Vec2::new(-hw, -hh + r) },
+            PathCommand::LineTo(Vec2::new(-hw, hh - r)),
+            PathCommand::QuadTo { ctrl: Vec2::new(-hw, hh), to: Vec2::new(-hw + r, hh) },
+            PathCommand::Close,
+        ]
+    }
+    fn ngon_path(sides: u32, r: f32) -> Vec<PathCommand> {
+        let mut commands = Vec::new();
+        for i in 0..sides {
+            let a = i as f32 / sides as f32 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
+            let p = Vec2::new(bevy::math::ops::cos(a), bevy::math::ops::sin(a)) * r;
+            commands.push(if i == 0 { PathCommand::MoveTo(p) } else { PathCommand::LineTo(p) });
+        }
+        commands.push(PathCommand::Close);
+        commands
+    }
+
+    commands.spawn(Camera2d);
+    let mut rng = Rng(0xB3_59_1D);
+
+    for i in 0..cfg.elements {
+        let (pos, size) = layout(i, cfg.elements, &mut rng);
+        let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize].to_linear();
+        // Same rng draws as the control; scale stays 1.0 — size is in the path.
+        let (transform, anim) = animated(pos, 1.0, &mut rng);
+
+        let kind = rng.pick(100);
+        let shape = match kind {
+            0..40 => {
+                if kind >= 20 {
+                    let thickness = rng.range(0.1, 0.3) * size;
+                    VectorShape { commands: circle_path(size), style: stroke(color, thickness) }
+                } else {
+                    VectorShape { commands: circle_path(size), style: fill(color) }
+                }
+            }
+            40..65 => {
+                let thickness =
+                    (kind >= 55).then(|| rng.range(0.1, 0.25) * size);
+                let corner = (kind % 2 == 0).then(|| rng.range(0.1, 0.4) * size).unwrap_or(0.0);
+                let aspect = rng.range(0.6, 2.4);
+                let path = rounded_rect_path(2.0 * aspect * size, 2.0 * size, corner);
+                match thickness {
+                    Some(thickness) => VectorShape { commands: path, style: stroke(color, thickness) },
+                    None => VectorShape { commands: path, style: fill(color) },
+                }
+            }
+            65..80 => {
+                let thickness = (kind >= 74).then(|| rng.range(0.1, 0.3) * size);
+                let sides = 3 + rng.pick(6);
+                let path = ngon_path(sides, size);
+                match thickness {
+                    Some(thickness) => VectorShape { commands: path, style: stroke(color, thickness) },
+                    None => VectorShape { commands: path, style: fill(color) },
+                }
+            }
+            _ => {
+                let thickness = rng.range(0.15, 0.4) * size;
+                let dir = Vec3::new(rng.range(-1.0, 1.0), rng.range(-1.0, 1.0), 0.0)
+                    .normalize_or(Vec3::X)
+                    * size;
+                VectorShape {
+                    commands: vec![
+                        PathCommand::MoveTo(-dir.truncate()),
+                        PathCommand::LineTo(dir.truncate()),
+                    ],
+                    style: stroke(color, thickness),
+                }
+            }
+        };
+        commands.spawn((shape, transform, anim));
     }
 }
 
@@ -500,6 +645,9 @@ fn main() {
     match cfg.backend {
         Backend::Shapes => app.add_systems(Startup, setup_shapes),
         Backend::Sprites => app.add_systems(Startup, setup_sprites),
+        Backend::Engine => app
+            .add_plugins(bevy_pf_vector::PfVectorPlugin)
+            .add_systems(Startup, setup_engine),
     };
 
     app.run();

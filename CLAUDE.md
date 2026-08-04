@@ -58,10 +58,25 @@ mostly-static topology, so tessellate once and GPU-instance every frame.
   elements: non-overlapping distributions, identical primitive counts).
   Bar to beat for workload 1: shapes control ~0.023 ms GPU / 200 elements.
 
-## Next task
+## Engine status (2026-08-03)
 
-Implement the engine's first vertical slice behind `VectorBackend`:
-tessellate `VectorShape` components at first sight (lyon), persistent GPU
-geometry + instance buffers, WGSL instancing shader, `vector_pass` wired into
-the RenderGraph schedule — visible in the testbed, then measured against the
-`shapes` control in the harness.
+The vertical slice is implemented, proven in the testbed (engine output
+matches gizmo ground truth), and measured. Workload 1, RTX A6000/Vulkan,
+p50: 200 elements 0.0174 ms GPU (control 0.0225); 5000 elements 0.324 ms
+GPU (control 0.932), CPU frame 1.66 ms (control 3.73). Design points, all
+portable wgpu: tessellate-once keyed by content hash; exact-coverage
+triangles (~4x fewer fragment invocations than SDF quads); opaque/blend
+split — opaque draws with early-z depth write, grouped by geometry for
+instancing since depth makes order irrelevant; 36-byte instances
+(2x2 affine + translation + z + RGBA8).
+
+## Next tasks
+
+- Workloads 2-4 (animated params, clip stress, stroke stress) in the
+  benchmark suite; vendored rive-bevy/vello as opponents.
+- Style-change handling (VectorShape color changes without re-tessellation
+  — currently color is per-instance so it works, but path edits leak old
+  geometry in the cache; add eviction).
+- AMD / Intel / Apple-Metal measurement passes when hardware is available;
+  "fastest" claims are NVIDIA/Vulkan-only until then.
+- bevy_pf integration in the sibling testbed once bevy_pf lands locally.
