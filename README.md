@@ -45,13 +45,29 @@ vertex/primitive counts, and a 200 → 5000 element sweep scales GPU time 38x.
 ## Workload 1 results (RTX A6000, Vulkan — p50 over 600 frames)
 
 Each backend measured at its shipped configuration: the control under its
-default MSAA 4x, the engine single-sample (its AA is analytic).
+default MSAA 4x, vello with its default Area AA and full compute pipeline
+(scene re-encoded per frame from retained BezPaths, GPU time bracketed by
+timestamps around its submission), the engine single-sample (its AA is
+analytic). Same 2560x1440 target, same rng-identical workload — verified
+visually via `--screenshot` for engine and vello.
 
-| backend | 200 el GPU | 5000 el GPU | 5000 el pass-record CPU |
+| backend | 200 el GPU | 5000 el GPU | per-frame path/scene CPU (5000 el) |
 |---|---|---|---|
-| shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | 0.322 ms |
-| engine, first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | 0.035 ms |
-| **engine, current** | **0.0082 ms** | **0.137 ms (6.8x)** | **0.0019 ms** |
+| vello 0.9 (in-process, shared device) | 0.816 ms | 1.493 ms | 0.385 ms encode (p95 1.14) |
+| shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | — |
+| engine, first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | — |
+| **engine, current** | **0.0082 ms** | **0.137 ms** | **none (tessellate-once)** |
+
+Engine vs vello: ~100x at 200 elements, ~11x at 5000. Vello's ~0.8 ms floor
+at low element counts is its canvas-sized compute pipeline — the per-frame
+cost a general-purpose renderer pays regardless of content, and exactly what
+the tessellate-once design avoids. This is not a knock on vello: it handles
+arbitrary dynamic scenes this engine deliberately does not.
+
+Not yet measured: the native Rive Renderer (rive-bevy pins an older Bevy and
+renders through vello anyway, so its numbers would approximate vello's; the
+native renderer would need a standalone harness), Skia, Pathfinder
+(different stacks, standalone harnesses), and workloads 2-4.
 
 The engine wins by structure, not tuning:
 

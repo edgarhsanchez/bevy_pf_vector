@@ -80,10 +80,24 @@ from any reference renderer:
   multi_draw_indexed_indirect per phase when INDIRECT_FIRST_INSTANCE is
   available (runtime-detected), draw loop otherwise
 
+## Opponent comparisons (workload 1, RTX A6000/Vulkan, p50)
+
+- vello 0.9 measured IN-PROCESS (shared wgpu 29 device, per-frame scene
+  encode from retained BezPaths, GPU bracketed with timestamp spans around
+  its internal submit, composited via fullscreen sprite): 0.816 ms @200 el,
+  1.493 ms @5000 el, plus 0.4-1.1 ms/frame CPU scene encode. Engine wins
+  ~100x @200, ~11x @5000. Vello's ~0.8 ms floor is canvas-sized compute —
+  the per-frame cost thesis, measured. Screenshot-verified identical
+  workload (`--backend vello --screenshot`).
+- Native Rive Renderer: NOT measurable in-process (rive-bevy pins old Bevy
+  and renders via vello anyway; native renderer would need a standalone
+  harness — the in-engine interop path was removed by the purity decision).
+- Skia / Pathfinder: unmeasured, would need standalone harnesses.
+
 ## Next tasks
 
 - Workloads 2-4 (animated params, clip stress, stroke stress) in the
-  benchmark suite; vendored rive-bevy/vello as opponents.
+  benchmark suite — vello backend already wired as the opponent.
 - Style-change handling (VectorShape color changes without re-tessellation
   — currently color is per-instance so it works, but path edits leak old
   geometry in the cache; add eviction).

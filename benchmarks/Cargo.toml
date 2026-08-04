@@ -10,3 +10,5 @@ publish = false
 bevy = { version = "0.19", default-features = false, features = ["2d"] }
 bevy_vector_shapes = "0.13.1"
 bevy_pf_vector = { path = "../bevy_pf_vector" }
+vello = "0.9"
+

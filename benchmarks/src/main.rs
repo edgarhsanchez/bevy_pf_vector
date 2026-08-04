@@ -29,11 +29,14 @@ use bevy_vector_shapes::prelude::*;
 
 // ---------------------------------------------------------------- config
 
+mod vello_backend;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     Shapes,
     Sprites,
     Engine,
+    Vello,
 }
 
 impl Backend {
@@ -42,6 +45,7 @@ impl Backend {
             Backend::Shapes => "shapes",
             Backend::Sprites => "sprites",
             Backend::Engine => "engine",
+            Backend::Vello => "vello",
         }
     }
 }
@@ -54,6 +58,7 @@ struct BenchConfig {
     frames: u32,
     out_dir: PathBuf,
     label: String,
+    screenshot: bool,
 }
 
 fn parse_args() -> BenchConfig {
@@ -63,6 +68,7 @@ fn parse_args() -> BenchConfig {
     let mut frames = 600u32;
     let mut out_dir = PathBuf::from("benchmarks/results");
     let mut label = None;
+    let mut screenshot = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -76,7 +82,8 @@ fn parse_args() -> BenchConfig {
                     "shapes" => Backend::Shapes,
                     "sprites" => Backend::Sprites,
                     "engine" => Backend::Engine,
-                    other => panic!("unknown backend '{other}' (shapes|sprites|engine)"),
+                    "vello" => Backend::Vello,
+                    other => panic!("unknown backend '{other}' (shapes|sprites|engine|vello)"),
                 }
             }
             "--elements" => elements = value().parse().expect("--elements"),
@@ -84,13 +91,14 @@ fn parse_args() -> BenchConfig {
             "--frames" => frames = value().parse().expect("--frames"),
             "--out" => out_dir = PathBuf::from(value()),
             "--label" => label = Some(value()),
+            "--screenshot" => screenshot = true,
             other => panic!("unknown argument '{other}'"),
         }
     }
 
     let label =
         label.unwrap_or_else(|| format!("{}_{}el_{}f", backend.name(), elements, frames));
-    BenchConfig { backend, elements, warmup, frames, out_dir, label }
+    BenchConfig { backend, elements, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -451,8 +459,17 @@ fn sample(
     diagnostics: Res<DiagnosticsStore>,
     adapter: Option<Res<RenderAdapterInfo>>,
     mut state: ResMut<BenchState>,
+    mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
 ) {
+    if cfg.screenshot && frame.0 == 90 {
+        commands
+            .spawn(bevy::render::view::screenshot::Screenshot::primary_window())
+            .observe(bevy::render::view::screenshot::save_to_disk(
+                cfg.out_dir.join(format!("{}.png", cfg.label)),
+            ));
+    }
+
     if frame.0 <= cfg.warmup {
         return;
     }
@@ -654,6 +671,10 @@ fn main() {
         Backend::Sprites => app.add_systems(Startup, setup_sprites),
         Backend::Engine => app
             .add_plugins(bevy_pf_vector::PfVectorPlugin)
+            .add_systems(Startup, setup_engine),
+        // Same VectorShape entities as the engine backend, rendered by vello.
+        Backend::Vello => app
+            .add_plugins(vello_backend::VelloBackendPlugin)
             .add_systems(Startup, setup_engine),
     };
 
