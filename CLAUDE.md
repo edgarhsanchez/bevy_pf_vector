@@ -459,16 +459,29 @@ DONE:
   paints through the engine's VectorPainter, and bezier wires are now one
   cached cubic path each instead of a 24-segment polyline per frame.
 
-REMAINING, and bigger than it looked:
-- `friginrain_hud` (SEPARATE crate, C:/github/friginrain_hud) draws the
-  in-world HUD — minimap, skill tree, hud_edit — with 31 `ShapePainter`
-  calls across 6 files. `bevy_vector_shapes` cannot leave friginrain2
-  until that crate moves too; runtime.rs and game_view/mod.rs only still
-  register `Shape2dPlugin` on its behalf.
-- `tool_workspace` still builds its cards/buttons/progress from
-  hud_component_lab. Converting those to XAML is what lets the lab be
-  deleted outright; `theme` and `interaction` then need rehoming (tokens
-  already exist as `assets/ui/obsidian/tokens.xaml`).
+DONE since:
+- `friginrain_hud` (separate crate) ported: minimap, skill tree, hud_edit
+  and its shared theme drawing layer now paint through the engine.
+- hud_component_lab's last three widgets and its demo runner ported;
+  legacy `shapes.rs` stripped to painter-free helpers.
+- **`bevy_vector_shapes` is removed from every manifest.** The client has
+  ONE 2D vector renderer. Builds and boots clean.
+
+The port was a type swap, not a rewrite, because the engine grew a
+STATEFUL painter mode (set_translation/set_rotation/color/hollow/thickness
+then rect/circle/ngon/arc) mirroring the API that code was written
+against. Worth keeping for any future migration off an immediate-mode
+painter.
+
+REMAINING:
+- `tool_workspace` still builds cards/buttons/progress from
+  hud_component_lab — they render on the engine now, but they are not
+  XAML. Converting them is what lets the lab be deleted outright;
+  `theme` and `interaction` then need rehoming (tokens already exist as
+  `assets/ui/obsidian/tokens.xaml`).
+- The in-world HUD is engine-drawn, not XAML, and that is the right
+  answer: a minimap and skill-tree canvas are per-frame vector drawing,
+  not stock controls.
 
 ## Next tasks
 
