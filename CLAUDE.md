@@ -172,16 +172,20 @@ beside Shape2dPlugin; commit c9abaa7 there). Full game type-checks and
 boots with the engine active (18s smoke run, real gameplay systems
 ticking, no engine-related errors). Migration surface mapped from their
 code: dialogs/HUD draw via IMMEDIATE-MODE ShapePainter with RenderLayers
-(frizbi_dialog/mod.rs draw_chrome etc.). Porting them 1:1 needs two
-engine features, in order:
-1. RenderLayers-aware extraction (per-view filtering; today all
-   VectorShapes draw on every 2D camera) — hard prerequisite.
-2. An immediate-mode painter API (per-frame command list -> transient
-   instances; our dynamic/parametric paths make this cheap).
-Then: port frizbi_dialog chrome as the template, and wire bevy_pf''s
+(frizbi_dialog/mod.rs draw_chrome etc.). Both migration prerequisites landed (engine commit bf93403):
+RenderLayers-aware per-view filtering, and the immediate-mode
+VectorPainter. The vector pass moved to Core2dSystems::Prepass so
+opaque vector content depth-interleaves with main-pass 2D content
+(sprites/text/bevy_vector_shapes draw over it by z) — the enabler for
+piecemeal migration. First surface ported (game commit c76c815):
+frizbi_dialog draw_chrome/draw_account_tray via
+hud_component_lab::pf_shapes, the signature-compatible VectorPainter
+port of their shapes helpers. Migration template: swap the painter
+param + shapes:: -> pf_shapes:: per system. Still legacy: all widgets
+(widgets.rs), tuner, other HUD painters. Still open: wire bevy_pf''s
 shapes.rs (its docs reserve a GPU-backend seam; currently tiny-skia CPU
 rasterization into UI images — correct integration is UI-render-phase
-injection or per-shape render-to-texture, needing RenderLayers too).
+injection or per-shape render-to-texture).
 
 ## Next tasks
 
