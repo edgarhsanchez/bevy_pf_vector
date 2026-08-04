@@ -12,3 +12,14 @@ bevy_vector_shapes = "0.13.1"
 bevy_pf_vector = { path = "../bevy_pf_vector" }
 vello = "0.9"
 
+
+[features]
+# Frame profiler. Attributes per-system CPU time, which GPU timestamp queries
+# cannot: the 1M tier showed ~215 ms/frame of CPU outside the vector pass and
+# guessing where it goes is not measurement.
+#   tracy-capture.exe -o trace.tracy   (then run the harness)
+#   tracy-csvexport.exe trace.tracy > zones.csv
+# `trace` emits the spans; `trace_tracy` only selects the backend that
+# transports them. Both are required — with only the latter you capture
+# startup and nothing else, which is exactly the trap this comment exists for.
+tracy = ["bevy/trace", "bevy/trace_tracy"]
