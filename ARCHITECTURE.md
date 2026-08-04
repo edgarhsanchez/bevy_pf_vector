@@ -1,6 +1,6 @@
 # bevy_pf_vector — scope, architecture, and what is actually achievable
 
-Status: benchmark harness built and validated; engine implementation next.
+Status: engine implemented; all four benchmark workloads measured and won (see README).
 
 > **Update 2026-08-03:** by project decision the engine is pure — path A
 > (native rive interop) was removed from the codebase entirely. §2's
@@ -8,7 +8,7 @@ Status: benchmark harness built and validated; engine implementation next.
 > record of why the design space looks the way it does. Competing renderers
 > exist in this repo only as benchmark opponents under `benchmarks/vendor/`.
 > Bevy 0.19 also replaced the Node-based render graph with a schedule
-> (`RenderGraph` is a `ScheduleLabel`); node.rs documents the new idiom.
+> (`RenderGraph` is a `ScheduleLabel`); render.rs implements the new idiom.
 
 ## 1. Scope correction, stated plainly
 
