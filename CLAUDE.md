@@ -109,7 +109,7 @@ from any reference renderer:
 
 StrokeStyle.dash + kurbo stroke expansion (dash/join/cap correct) ->
 fill-tessellated once; undashed strokes stay on lyon. 300 strokes p50:
-engine 0.81 ms frame / 0.0236 GPU; vello 1.33 / 0.833; control cannot
+engine 0.81 ms frame / 0.0236 GPU; Vello 1.33 / 0.833; bevy_vector_shapes cannot
 run it. All four ARCHITECTURE workloads + overlap stress now measured
 and won on every backend able to compete. Remaining frontier: rive
 native on W2-4, Skia/Pathfinder harnesses, AMD/Intel/Metal.
@@ -123,9 +123,9 @@ instance packs (chain_start*8+count) into its spare instance-lane float;
 fragment multiplies AA'd SDF coverage per entry (straight-line unrolled, no
 loop). Clipped instances route to the blend phase (opaque REPLACE would
 ignore the alpha knock-out — that was bug #1). Results (12 panels + outer,
-240 shapes, p50): engine 0.78 ms frame / 0.0266 ms GPU; vello (native clip
-layers, chain-diff push/pop encoding in the backend) 1.11 / 0.953; control
-CANNOT run it (no clipping). ~36x GPU vs vello.
+240 shapes, p50): engine 0.78 ms frame / 0.0266 ms GPU; Vello (native clip
+layers, chain-diff push/pop encoding in the backend) 1.11 / 0.953;
+bevy_vector_shapes CANNOT run it (no clipping). ~36x GPU vs vello.
 
 Bug worth remembering: view.viewport is (origin.xy, size.zw) —
 `viewport.x` is ORIGIN (0!), width is `.z`. Using .x made px_world

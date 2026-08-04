@@ -30,7 +30,14 @@ ground: a Bevy app consuming this crate as a path dependency.
     cargo run --release -p benchmarks -- --backend shapes --elements 200
     cargo run --release -p benchmarks -- --backend sprites --elements 200
 
-Flags: `--backend shapes|sprites`, `--elements N` (default 200), `--frames N`
+Backend names map to products: `engine` = bevy_pf_vector (this repo's
+renderer, the thing being proven); `shapes` = bevy_vector_shapes 0.13
+(third-party Bevy crate, the original baseline); `vello` = Vello 0.9
+(Linebender, in-process); `sprites` = plain Bevy sprites (harness
+validation only). The native C++ Rive Renderer runs via its own patched
+harness (see below), not a `--backend`.
+
+Flags: `--backend engine|shapes|vello|sprites`, `--elements N` (default 200), `--frames N`
 (default 600), `--warmup N` (default 120), `--out DIR`, `--label NAME`.
 Prints p50/p95/p99 for CPU frame time and every `render/*` diagnostic
 (per-pass GPU time via timestamp queries, pipeline statistics), and writes
@@ -44,8 +51,8 @@ vertex/primitive counts, and a 200 → 5000 element sweep scales GPU time 38x.
 
 ## Workload 1 results (RTX A6000, Vulkan — p50 over 600 frames)
 
-Each backend measured at its shipped configuration: the control under its
-default MSAA 4x, vello with its default Area AA and full compute pipeline
+Each backend measured at its shipped configuration: bevy_vector_shapes
+under its default MSAA 4x, Vello with its default Area AA and full compute pipeline
 (scene re-encoded per frame from retained BezPaths, GPU time bracketed by
 timestamps around its submission), the engine single-sample (its AA is
 analytic). Same 2560x1440 target, same rng-identical workload — verified
@@ -53,10 +60,10 @@ visually via `--screenshot` for engine and vello.
 
 | backend | 200 el GPU | 5000 el GPU | per-frame path/scene CPU (5000 el) |
 |---|---|---|---|
-| vello 0.9 (in-process, shared device) | 0.816 ms | 1.493 ms | 0.385 ms encode (p95 1.14) |
-| shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | — |
-| engine, first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | — |
-| **engine, current** | **0.0143 ms** | **0.200 ms** | **none (tessellate-once)** |
+| Vello 0.9 (Linebender, in-process) | 0.816 ms | 1.493 ms | 0.385 ms encode (p95 1.14) |
+| bevy_vector_shapes 0.13 (third-party crate) | 0.0225 ms | 0.932 ms | — |
+| bevy_pf_vector — first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | — |
+| **bevy_pf_vector (ours)** | **0.0143 ms** | **0.200 ms** | **none (tessellate-once)** |
 
 **Native Rive Renderer (C++), measured.** Built from rive-runtime at the
 pinned SHA (clang/lld, Vulkan backend, SPIR-V via glslang) with a local
@@ -69,14 +76,14 @@ renderer cost:
 
 | | 200 el | 5000 el |
 |---|---|---|
-| rive native frame (p50) | 0.204 ms | 1.716 ms |
-| engine renderer cost (GPU pass + record + prepare) | ~0.015 ms | ~0.19 ms |
+| Rive Renderer (native C++) frame (p50) | 0.204 ms | 1.716 ms |
+| bevy_pf_vector (ours) renderer cost (GPU pass + record + prepare) | ~0.015 ms | ~0.19 ms |
 
 Renderer-for-renderer the engine is roughly an order of magnitude faster at
 both scales, and our entire Bevy frame at 5000 elements (1.16 ms, ECS and
 all — after layout-fingerprint caching, foldhash keys made prepare a pure gather and the
-benchmark client's animation went parallel; control measured with the same
-client at 3.31 ms) clearly beats rive's render-only loop (1.72 ms). The dominant
+benchmark client's animation went parallel; bevy_vector_shapes measured
+with the same client at 3.31 ms) clearly beats the Rive Renderer's render-only loop (1.72 ms). The dominant
 remaining frame cost is Bevy's transform propagation, not the renderer —
 the next lever is an opt-in flat HUD transform path that bypasses the
 hierarchy, plus change-detection extraction for mostly-static HUDs. Rive pays per-frame path
@@ -86,7 +93,7 @@ loop is render-only, but CPU/GPU overlap means GPU-only could be lower);
 comparison is Vulkan-on-NVIDIA only; rive's atomic/MSAA fallback modes and
 feather/clip-heavy content (workloads 3-4) not yet measured.
 
-Engine vs vello: ~100x at 200 elements, ~11x at 5000. Vello's ~0.8 ms floor
+bevy_pf_vector vs Vello: ~100x at 200 elements, ~11x at 5000. Vello's ~0.8 ms floor
 at low element counts is its canvas-sized compute pipeline — the per-frame
 cost a general-purpose renderer pays regardless of content, and exactly what
 the tessellate-once design avoids. This is not a knock on vello: it handles
@@ -97,10 +104,10 @@ arbitrary dynamic scenes this engine deliberately does not.
 
 | backend | frame | render GPU |
 |---|---|---|
-| shapes (SDF control) | 0.99 ms | 0.0215 ms |
-| vello 0.9 | 1.19 ms | 0.854 ms |
-| engine, `VectorShape` mutation (re-tessellating) | 1.52 ms | 0.0092 ms |
-| **engine, `VectorPrimitive::Arc` (parametric)** | **0.78 ms** | **0.0155 ms** |
+| bevy_vector_shapes 0.13 (third-party crate) | 0.99 ms | 0.0215 ms |
+| Vello 0.9 (Linebender) | 1.19 ms | 0.854 ms |
+| bevy_pf_vector — VectorShape mutation (re-tessellating) | 1.52 ms | 0.0092 ms |
+| **bevy_pf_vector (ours) — parametric arcs** | **0.78 ms** | **0.0155 ms** |
 
 The engine wins workload 2 on both metrics via `VectorPrimitive` — a
 canonical (t, side) strip mesh whose vertex shader computes ring-segment
@@ -115,9 +122,9 @@ into a transient buffer region, priced per changed shape, cache untouched.
 
 | backend | frame | render GPU |
 |---|---|---|
-| shapes control | not supported (no clipping) | — |
-| vello 0.9 (native clip layers) | 1.11 ms | 0.953 ms |
-| **engine (`--clips 12`)** | **0.78 ms** | **0.0266 ms** |
+| bevy_vector_shapes 0.13 | not supported (no clipping) | — |
+| Vello 0.9 (Linebender, native clip layers) | 1.11 ms | 0.953 ms |
+| **bevy_pf_vector (ours)** (`--clips 12`) | **0.78 ms** | **0.0266 ms** |
 
 Clipping is analytic: clip shapes (`VectorClipShape` rounded-rects/circles,
 nested via `ClippedBy`, up to 4 deep) live in a storage buffer as inverse
@@ -137,13 +144,13 @@ but with broken edge AA. The tables above are the honest, corrected values.
 
 | backend | render GPU | fragment invocations |
 |---|---|---|
-| shapes control | 0.285 ms | 12.9 M |
-| vello 0.9 | 1.083 ms | — |
-| **engine (`--overlap`)** | **0.0686 ms** | **1.07 M** |
+| bevy_vector_shapes 0.13 | 0.285 ms | 12.9 M |
+| Vello 0.9 (Linebender) | 1.083 ms | — |
+| **bevy_pf_vector (ours)** (`--overlap`) | **0.0686 ms** | **1.07 M** |
 
 Dense overlap is where the depth-based opaque path pays off hardest: opaque
 groups draw front-to-back (nearest group first, preserving instancing), so
-early-z rejects ~12x the fragment work the control shades. Honest limits:
+early-z rejects ~12x the fragment work bevy_vector_shapes shades. Honest limits:
 the win applies to opaque content — translucent stacks blend per layer like
 every rasterizer — and crossing AA fringes of different shapes can
 double-blend (conflation), invisible in HUDs, occasionally visible in
@@ -155,9 +162,9 @@ conflation artifacts.
 
 | backend | frame | render GPU |
 |---|---|---|
-| shapes control | not supported (no polyline strokes/joins/dashes) | — |
-| vello 0.9 (native dashed strokes) | 1.33 ms | 0.833 ms |
-| **engine (`--strokes 300`)** | **0.81 ms** | **0.0236 ms** |
+| bevy_vector_shapes 0.13 | not supported (no polyline strokes/joins/dashes) | — |
+| Vello 0.9 (Linebender, native dashed strokes) | 1.33 ms | 0.833 ms |
+| **bevy_pf_vector (ours)** (`--strokes 300`) | **0.81 ms** | **0.0236 ms** |
 
 `StrokeStyle` now supports `dash: Some([on, off])`: dashed strokes expand to
 fill outlines via kurbo stroke expansion (real joins, caps, dashes) and
