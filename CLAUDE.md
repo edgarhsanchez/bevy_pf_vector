@@ -375,6 +375,39 @@ What is actually left on the table, in order of expected payoff:
    a large part of that).
 4. Clear only live atlas slots instead of the whole 2048^2.
 
+## PROFILED: where the CPU time actually goes (2026-08-04)
+
+Measured, not inferred. `--features chrome` (bevy/trace + trace_chrome)
+writes trace-*.json; parse B/E pairs into SELF time per span. Tracy is
+also wired (`--features tracy`, binaries in E:/github/tracy) but its
+per-system zones were not landing; chrome tracing is the working path,
+as it was for the earlier workload-2 investigation.
+
+200,000 elements, self time share:
+
+| span                                    | share |
+|-----------------------------------------|-------|
+| `render::extract_shapes`                | 40.6% |
+| `render::prepare_vector_buffers`        |  5.2% |
+| transform propagation (par_for_each)    |  0.4% |
+| `render::vector_pass`                   |  0.0% |
+
+CORRECTION: the 1M note above attributed the missing ~215 ms/frame to
+"extract, sort, batch, and Bevy's own propagation". Propagation is 0.4%
+— NEGLIGIBLE. It is almost entirely `extract_shapes`, which is OUR code.
+Forking or patching Bevy would have aimed at the wrong target; that idea
+is parked until something actually points at Bevy.
+
+Absolute numbers under chrome tracing are inflated (~16x versus the
+uninstrumented frame time), so read the SHARES, not the milliseconds.
+
+So the optimisation list from the 1M tier resolves to one item:
+`extract_shapes` is the wall. It runs serially over every shape doing a
+transform decompose, two hash-map lookups (content key + geometry cache)
+and an instance push. Parallelising it — per-thread instance buffers
+concatenated after — is the single highest-value change left in the
+engine.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%

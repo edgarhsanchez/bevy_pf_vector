@@ -23,3 +23,6 @@ vello = "0.9"
 # transports them. Both are required — with only the latter you capture
 # startup and nothing else, which is exactly the trap this comment exists for.
 tracy = ["bevy/trace", "bevy/trace_tracy"]
+# Chrome tracing: writes trace-*.json of B/E spans, parseable without a GUI.
+# Same rule as tracy -- `trace` emits the spans, this only selects transport.
+chrome = ["bevy/trace", "bevy/trace_chrome"]
