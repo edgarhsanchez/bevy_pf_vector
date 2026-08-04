@@ -26,6 +26,7 @@ use std::ops::Range;
 use bevy::platform::collections::HashMap;
 
 use bevy::asset::{load_internal_asset, uuid_handle};
+use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::core_2d::CORE_2D_DEPTH_FORMAT;
 use bevy::core_pipeline::schedule::{Core2d, Core2dSystems};
 use bevy::mesh::VertexBufferLayout;
@@ -48,6 +49,7 @@ use bevy::render::view::{ExtractedView, Msaa, ViewDepthTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
 use bevy::shader::Shader;
 
+use crate::painter::VectorPainterQueue;
 use crate::tess;
 use crate::{ClippedBy, HudTransform, VectorClipShape, VectorPrimitive, VectorShape};
 
@@ -76,6 +78,7 @@ impl Plugin for VectorRenderPlugin {
             .init_resource::<ExtractedShapes>()
             .init_resource::<ExtractedParametrics>()
             .init_resource::<ExtractedClips>()
+            .init_resource::<LayerTable>()
             .init_resource::<GradientAtlas>()
             .init_resource::<VectorBuffers>()
             .init_resource::<VectorViewBindGroups>()
@@ -151,6 +154,45 @@ fn pack_clip(start: u32, count: u32) -> f32 {
 pub struct ExtractedClips {
     entries: Vec<GpuClip>,
     chains: HashMap<Entity, (u32, u32)>,
+}
+
+/// Per-frame interned `RenderLayers` masks. Instances and batches carry a
+/// small id into this table instead of the mask itself; the pass resolves
+/// ids against the current frame's table, so layer *content* changes are
+/// picked up even on the layout-fingerprint fast path (the id assignment
+/// pattern is part of the fingerprint, the masks themselves need not be).
+/// Id 0 is always the default mask (layer 0).
+#[derive(Resource, Default)]
+pub struct LayerTable {
+    masks: Vec<RenderLayers>,
+}
+
+impl LayerTable {
+    fn clear(&mut self) {
+        self.masks.clear();
+    }
+
+    fn intern(&mut self, layers: Option<&RenderLayers>) -> u16 {
+        if self.masks.is_empty() {
+            self.masks.push(RenderLayers::default());
+        }
+        match layers {
+            None => 0,
+            Some(layers) => match self.masks.iter().position(|m| m == layers) {
+                Some(index) => index as u16,
+                None => {
+                    self.masks.push(layers.clone());
+                    (self.masks.len() - 1) as u16
+                }
+            },
+        }
+    }
+
+    fn visible(&self, id: u16, view: &RenderLayers) -> bool {
+        self.masks
+            .get(id as usize)
+            .is_none_or(|mask| mask.intersects(view))
+    }
 }
 
 /// Gradient lookup atlas: each unique stop list bakes once into a 256-texel
@@ -487,6 +529,7 @@ struct ExtractedInstance {
     brush_meta: f32,
     opaque: bool,
     clip: f32,
+    layer: u16,
 }
 
 #[derive(Resource, Default)]
@@ -524,6 +567,7 @@ struct VectorBatch {
     indices: Range<u32>,
     base_vertex: i32,
     instances: Range<u32>,
+    layer: u16,
 }
 
 struct ParamItem {
@@ -534,6 +578,7 @@ struct ParamItem {
     params: [f32; 4],
     opaque: bool,
     clip: f32,
+    layer: u16,
 }
 
 #[derive(Resource, Default)]
@@ -575,6 +620,9 @@ pub struct VectorBuffers {
     param_instance_capacity: usize,
     param_opaque_count: u32,
     param_total_count: u32,
+    /// Contiguous layer-homogeneous runs over the sorted parametric
+    /// instances, so per-view filtering can skip whole runs.
+    param_layer_runs: Vec<(Range<u32>, u16)>,
     /// Fixed-capacity analytic clip storage (created once; bind groups stay
     /// stable), rewritten per frame.
     clip: Option<Buffer>,
@@ -776,19 +824,28 @@ fn pack_color(color: LinearRgba) -> [u8; 4] {
 /// Shapes whose `VectorShape` mutated this frame tessellate into the
 /// transient region instead — dynamic topology works, priced per changed
 /// shape, without poisoning the cache.
+#[allow(clippy::too_many_arguments)]
 fn extract_shapes(
     shapes: Extract<
-        Query<(Ref<VectorShape>, &GlobalTransform, Option<&ClippedBy>), Without<HudTransform>>,
+        Query<
+            (Ref<VectorShape>, &GlobalTransform, Option<&ClippedBy>, Option<&RenderLayers>),
+            Without<HudTransform>,
+        >,
     >,
-    flat_shapes: Extract<Query<(Ref<VectorShape>, &HudTransform, Option<&ClippedBy>)>>,
+    flat_shapes: Extract<
+        Query<(Ref<VectorShape>, &HudTransform, Option<&ClippedBy>, Option<&RenderLayers>)>,
+    >,
+    painted: Extract<Res<VectorPainterQueue>>,
     clips: Res<ExtractedClips>,
     mut cache: ResMut<GeometryCache>,
     mut extracted: ResMut<ExtractedShapes>,
     mut atlas: ResMut<GradientAtlas>,
+    mut layers: ResMut<LayerTable>,
 ) {
     extracted.items.clear();
     extracted.dynamic_vertices.clear();
     extracted.dynamic_indices.clear();
+    layers.clear();
 
     // Epoch flush: mutation churn appends new cache entries; when the cache
     // gets absurd, drop it wholesale and let live shapes re-populate.
@@ -796,7 +853,7 @@ fn extract_shapes(
         *cache = GeometryCache::default();
     }
 
-    for (shape, transform, clipped) in &shapes {
+    for (shape, transform, clipped, shape_layers) in &shapes {
         let model = transform.to_matrix();
         let linear = [
             model.x_axis.x,
@@ -810,16 +867,52 @@ fn extract_shapes(
             &mut extracted,
             &mut atlas,
             &clips,
-            &shape,
+            &shape.commands,
+            &shape.style,
+            shape.is_changed(),
             linear,
             translation,
             model.w_axis.z,
             clipped,
+            layers.intern(shape_layers),
         );
     }
-    for (shape, hud, clipped) in &flat_shapes {
+    for (shape, hud, clipped, shape_layers) in &flat_shapes {
         let (linear, translation, z) = hud.decompose();
-        push_shape(&mut cache, &mut extracted, &mut atlas, &clips, &shape, linear, translation, z, clipped);
+        push_shape(
+            &mut cache,
+            &mut extracted,
+            &mut atlas,
+            &clips,
+            &shape.commands,
+            &shape.style,
+            shape.is_changed(),
+            linear,
+            translation,
+            z,
+            clipped,
+            layers.intern(shape_layers),
+        );
+    }
+    // Immediate-mode painted shapes: always through the geometry cache —
+    // frame-repeated painting of the same local-space geometry costs one
+    // instance write, exactly like a retained shape.
+    for item in &painted.shapes {
+        let layer = layers.intern(item.layers.as_ref());
+        push_shape(
+            &mut cache,
+            &mut extracted,
+            &mut atlas,
+            &clips,
+            &item.commands,
+            &item.style,
+            false,
+            item.linear,
+            item.translation,
+            item.z,
+            None,
+            layer,
+        );
     }
 }
 
@@ -829,28 +922,30 @@ fn push_shape(
     extracted: &mut ExtractedShapes,
     atlas: &mut GradientAtlas,
     clips: &ExtractedClips,
-    shape: &Ref<VectorShape>,
+    commands: &[crate::path::PathCommand],
+    style: &crate::path::PathStyle,
+    // True on the frame a path/style mutates (and on spawn); those shapes
+    // skip the cache entirely this frame.
+    dynamic: bool,
     linear: [f32; 4],
     translation: [f32; 2],
     z: f32,
     clipped: Option<&ClippedBy>,
+    layer: u16,
 ) {
     let clip = clipped
         .and_then(|c| clips.chains.get(&c.0))
         .map(|&(start, count)| pack_clip(start, count))
         .unwrap_or(0.0);
     {
-        // `is_changed` is true on the frame a path/style mutates (and on
-        // spawn); those shapes skip the cache entirely this frame.
-        let dynamic = shape.is_changed();
-        if let Some(brush) = &shape.style.fill {
-            let rule = shape.style.fill_rule;
+        if let Some(brush) = &style.fill {
+            let rule = style.fill_rule;
             let geometry = if dynamic {
-                tess::tessellate_fill(&shape.commands, rule)
+                tess::tessellate_fill(commands, rule)
                     .map(|g| GeometryRef::Dynamic(extracted.append_dynamic(g)))
             } else {
-                let key = tess::fill_key(&shape.commands, rule);
-                cache.ensure(key, || tess::tessellate_fill(&shape.commands, rule));
+                let key = tess::fill_key(commands, rule);
+                cache.ensure(key, || tess::tessellate_fill(commands, rule));
                 Some(GeometryRef::Cached(key))
             };
             if let Some(geometry) = geometry {
@@ -867,16 +962,17 @@ fn push_shape(
                     // knock-out and for AA clip edges).
                     opaque: brush.is_opaque() && clip == 0.0,
                     clip,
+                    layer,
                 });
             }
         }
-        if let Some(stroke) = &shape.style.stroke {
+        if let Some(stroke) = &style.stroke {
             let geometry = if dynamic {
-                tess::tessellate_stroke(&shape.commands, stroke)
+                tess::tessellate_stroke(commands, stroke)
                     .map(|g| GeometryRef::Dynamic(extracted.append_dynamic(g)))
             } else {
-                let key = tess::stroke_key(&shape.commands, stroke);
-                cache.ensure(key, || tess::tessellate_stroke(&shape.commands, stroke));
+                let key = tess::stroke_key(commands, stroke);
+                cache.ensure(key, || tess::tessellate_stroke(commands, stroke));
                 Some(GeometryRef::Cached(key))
             };
             if let Some(geometry) = geometry {
@@ -892,6 +988,7 @@ fn push_shape(
                     brush_meta,
                     opaque: stroke.brush.is_opaque() && clip == 0.0,
                     clip,
+                    layer,
                 });
             }
         }
@@ -908,6 +1005,7 @@ fn push_primitive(
     translation: [f32; 2],
     z: f32,
     clipped: Option<&ClippedBy>,
+    layer: u16,
 ) {
     let clip = clipped
         .and_then(|c| clips.chains.get(&c.0))
@@ -922,6 +1020,7 @@ fn push_primitive(
         params: [start, sweep, inner, outer],
         opaque: color.alpha >= 1.0 && clip == 0.0,
         clip,
+        layer,
     });
 }
 
@@ -1034,14 +1133,21 @@ fn extract_clips(
 /// no geometry work of any kind.
 fn extract_primitives(
     primitives: Extract<
-        Query<(&VectorPrimitive, &GlobalTransform, Option<&ClippedBy>), Without<HudTransform>>,
+        Query<
+            (&VectorPrimitive, &GlobalTransform, Option<&ClippedBy>, Option<&RenderLayers>),
+            Without<HudTransform>,
+        >,
     >,
-    flat_primitives: Extract<Query<(&VectorPrimitive, &HudTransform, Option<&ClippedBy>)>>,
+    flat_primitives: Extract<
+        Query<(&VectorPrimitive, &HudTransform, Option<&ClippedBy>, Option<&RenderLayers>)>,
+    >,
+    painted: Extract<Res<VectorPainterQueue>>,
     clips: Res<ExtractedClips>,
     mut extracted: ResMut<ExtractedParametrics>,
+    mut layers: ResMut<LayerTable>,
 ) {
     extracted.0.clear();
-    for (primitive, transform, clipped) in &primitives {
+    for (primitive, transform, clipped, item_layers) in &primitives {
         let model = transform.to_matrix();
         push_primitive(
             &mut extracted,
@@ -1051,11 +1157,36 @@ fn extract_primitives(
             [model.w_axis.x, model.w_axis.y],
             model.w_axis.z,
             clipped,
+            layers.intern(item_layers),
         );
     }
-    for (primitive, hud, clipped) in &flat_primitives {
+    for (primitive, hud, clipped, item_layers) in &flat_primitives {
         let (linear, translation, z) = hud.decompose();
-        push_primitive(&mut extracted, &clips, primitive, linear, translation, z, clipped);
+        push_primitive(
+            &mut extracted,
+            &clips,
+            primitive,
+            linear,
+            translation,
+            z,
+            clipped,
+            layers.intern(item_layers),
+        );
+    }
+    // Immediate-mode painted arcs: pure instance data, like everything else
+    // on the parametric path.
+    for arc in &painted.arcs {
+        let layer = layers.intern(arc.layers.as_ref());
+        extracted.0.push(ParamItem {
+            z: arc.z,
+            linear: arc.linear,
+            translation: arc.translation,
+            color: pack_color(arc.color),
+            params: [arc.start, arc.sweep, arc.inner, arc.outer],
+            opaque: arc.color.alpha >= 1.0,
+            clip: 0.0,
+            layer,
+        });
     }
 }
 
@@ -1148,12 +1279,15 @@ fn prepare_vector_buffers(
             }),
         }
     };
-    let group_key = |geometry: &GeometryRef| -> (u8, u64) {
-        match geometry {
-            GeometryRef::Cached(key) => (0, *key),
+    // Batches must be homogeneous in geometry AND layer mask (per-view
+    // filtering skips whole batches), so the layer id is part of the key.
+    let group_key = |item: &ExtractedInstance| -> (u8, u64, u16) {
+        match &item.geometry {
+            GeometryRef::Cached(key) => (0, *key, item.layer),
             GeometryRef::Dynamic(range) => (
                 1,
                 (u64::from(range.interior_first) << 32) | u64::from(range.base_vertex as u32),
+                item.layer,
             ),
         }
     };
@@ -1168,7 +1302,7 @@ fn prepare_vector_buffers(
         let mut hasher = tess::fast_hasher();
         extracted.items.len().hash(&mut hasher);
         for item in &extracted.items {
-            group_key(&item.geometry).hash(&mut hasher);
+            group_key(item).hash(&mut hasher);
             item.z.to_bits().hash(&mut hasher);
             item.opaque.hash(&mut hasher);
             item.clip.to_bits().hash(&mut hasher);
@@ -1225,21 +1359,21 @@ fn prepare_vector_buffers(
     let mut opaque_order: Vec<usize> = (0..extracted.items.len())
         .filter(|&i| extracted.items[i].opaque)
         .collect();
-    let mut group_front: HashMap<(u8, u64), f32> = HashMap::default();
+    let mut group_front: HashMap<(u8, u64, u16), f32> = HashMap::default();
     for &i in &opaque_order {
         let item = &extracted.items[i];
-        let entry = group_front.entry(group_key(&item.geometry)).or_insert(item.z);
+        let entry = group_front.entry(group_key(item)).or_insert(item.z);
         *entry = entry.max(item.z);
     }
     opaque_order.sort_unstable_by(|&a, &b| {
         let (ia, ib) = (&extracted.items[a], &extracted.items[b]);
-        let (ka, kb) = (group_key(&ia.geometry), group_key(&ib.geometry));
+        let (ka, kb) = (group_key(ia), group_key(ib));
         group_front[&kb]
             .total_cmp(&group_front[&ka])
             .then(ka.cmp(&kb))
             .then(ib.z.total_cmp(&ia.z))
     });
-    let mut last_geometry: Option<(u8, u64)> = None;
+    let mut last_geometry: Option<(u8, u64, u16)> = None;
     for &item_index in &opaque_order {
         let item = &extracted.items[item_index];
         let Some(range) = resolve(&item.geometry) else {
@@ -1249,7 +1383,7 @@ fn prepare_vector_buffers(
             continue;
         }
         let index = push_instance(&mut instances, &mut buffers.permutation, item_index, item);
-        let key = group_key(&item.geometry);
+        let key = group_key(item);
         if last_geometry == Some(key) {
             buffers.opaque_batches.last_mut().unwrap().instances.end = index + 1;
         } else {
@@ -1257,6 +1391,7 @@ fn prepare_vector_buffers(
                 indices: range.interior_first..range.interior_first + range.interior_count,
                 base_vertex: range.base_vertex,
                 instances: index..index + 1,
+                layer: item.layer,
             });
             last_geometry = Some(key);
         }
@@ -1274,7 +1409,7 @@ fn prepare_vector_buffers(
         }
         blend_order.push((item_index, true));
     }
-    let mut last_key: Option<((u8, u64), bool)> = None;
+    let mut last_key: Option<((u8, u64, u16), bool)> = None;
     for &(item_index, is_fringe) in &blend_order {
         let item = &extracted.items[item_index];
         let Some(range) = resolve(&item.geometry) else {
@@ -1289,7 +1424,7 @@ fn prepare_vector_buffers(
             continue;
         }
         let index = push_instance(&mut instances, &mut buffers.permutation, item_index, item);
-        let key = (group_key(&item.geometry), is_fringe);
+        let key = (group_key(item), is_fringe);
         if last_key == Some(key) {
             buffers.blend_batches.last_mut().unwrap().instances.end = index + 1;
         } else {
@@ -1297,6 +1432,7 @@ fn prepare_vector_buffers(
                 indices: first..first + count,
                 base_vertex: range.base_vertex,
                 instances: index..index + 1,
+                layer: item.layer,
             });
             last_key = Some(key);
         }
@@ -1363,6 +1499,7 @@ fn prepare_parametrics(
     if extracted.0.is_empty() {
         buffers.param_total_count = 0;
         buffers.param_opaque_count = 0;
+        buffers.param_layer_runs.clear();
         return;
     }
     if buffers.param_vertex.is_none() {
@@ -1379,9 +1516,22 @@ fn prepare_parametrics(
         }));
     }
 
+    // Opaque section groups by layer (order-free under depth testing) to
+    // minimize layer runs; the translucent section stays strictly z-ordered
+    // and splits into runs wherever the layer changes.
     extracted.0.sort_unstable_by(|a, b| {
-        b.opaque.cmp(&a.opaque).then(a.z.total_cmp(&b.z))
+        b.opaque
+            .cmp(&a.opaque)
+            .then_with(|| if a.opaque { a.layer.cmp(&b.layer) } else { std::cmp::Ordering::Equal })
+            .then(a.z.total_cmp(&b.z))
     });
+    buffers.param_layer_runs.clear();
+    for (i, item) in extracted.0.iter().enumerate() {
+        match buffers.param_layer_runs.last_mut() {
+            Some((range, layer)) if *layer == item.layer => range.end = i as u32 + 1,
+            _ => buffers.param_layer_runs.push((i as u32..i as u32 + 1, item.layer)),
+        }
+    }
     let instances: Vec<GpuParamInstance> = extracted
         .0
         .iter()
@@ -1547,12 +1697,14 @@ fn vector_pass(
     pipeline_cache: Res<PipelineCache>,
     buffers: Res<VectorBuffers>,
     bind_groups: Res<VectorViewBindGroups>,
+    layer_table: Res<LayerTable>,
     view: ViewQuery<(
         &ExtractedCamera,
         &ExtractedView,
         &ViewTarget,
         &ViewDepthTexture,
         &Msaa,
+        Option<&RenderLayers>,
     )>,
     mut ctx: RenderContext,
 ) {
@@ -1569,7 +1721,8 @@ fn vector_pass(
         return;
     }
     let view_entity = view.entity();
-    let (camera, extracted_view, target, depth, msaa) = view.into_inner();
+    let (camera, extracted_view, target, depth, msaa, view_layers) = view.into_inner();
+    let view_mask = view_layers.cloned().unwrap_or_default();
 
     let get = |id: Option<CachedRenderPipelineId>| {
         id.and_then(|id| pipeline_cache.get_render_pipeline(id))
@@ -1637,31 +1790,64 @@ fn vector_pass(
         }};
     }
 
+    // Batches whose layer mask misses this view are skipped; contiguous
+    // visible runs still submit as single multi-draws, so the single-camera
+    // common case (everything visible) remains exactly two multi-draw calls.
+    macro_rules! draw_filtered {
+        ($batches:expr, $args_base:expr) => {{
+            let batches = $batches;
+            match indirect {
+                Some(indirect) => {
+                    let mut i = 0usize;
+                    while i < batches.len() {
+                        if !layer_table.visible(batches[i].layer, &view_mask) {
+                            i += 1;
+                            continue;
+                        }
+                        let start = i;
+                        while i < batches.len()
+                            && layer_table.visible(batches[i].layer, &view_mask)
+                        {
+                            i += 1;
+                        }
+                        pass.multi_draw_indexed_indirect(
+                            indirect,
+                            ($args_base + start) as u64 * args_size,
+                            (i - start) as u32,
+                        );
+                    }
+                }
+                None => {
+                    for batch in batches {
+                        if !layer_table.visible(batch.layer, &view_mask) {
+                            continue;
+                        }
+                        pass.draw_indexed(
+                            batch.indices.clone(),
+                            batch.base_vertex,
+                            batch.instances.clone(),
+                        );
+                    }
+                }
+            }
+        }};
+    }
+
     // Opaque phase: depth-tested, order-free across both sources.
     if tess_ready && !buffers.opaque_batches.is_empty() {
         bind_tessellated!();
         pass.set_render_pipeline(opaque_pipeline.unwrap());
-        match indirect {
-            Some(indirect) => pass.multi_draw_indexed_indirect(
-                indirect,
-                0,
-                buffers.opaque_batches.len() as u32,
-            ),
-            None => {
-                for batch in &buffers.opaque_batches {
-                    pass.draw_indexed(
-                        batch.indices.clone(),
-                        batch.base_vertex,
-                        batch.instances.clone(),
-                    );
-                }
-            }
-        }
+        draw_filtered!(&buffers.opaque_batches, 0);
     }
     if params_ready && buffers.param_opaque_count > 0 {
         bind_params!();
         pass.set_render_pipeline(param_opaque_pipeline.unwrap());
-        pass.draw_indexed(0..ARC_INTERIOR_INDEX_COUNT, 0, 0..buffers.param_opaque_count);
+        for (range, layer) in &buffers.param_layer_runs {
+            let run = range.start..range.end.min(buffers.param_opaque_count);
+            if run.start < run.end && layer_table.visible(*layer, &view_mask) {
+                pass.draw_indexed(0..ARC_INTERIOR_INDEX_COUNT, 0, run);
+            }
+        }
     }
 
     // Blend phase. Tessellated blend items are strictly back-to-front among
@@ -1671,34 +1857,25 @@ fn vector_pass(
     if tess_ready && !buffers.blend_batches.is_empty() {
         bind_tessellated!();
         pass.set_render_pipeline(blend_pipeline.unwrap());
-        match indirect {
-            Some(indirect) => pass.multi_draw_indexed_indirect(
-                indirect,
-                buffers.opaque_batches.len() as u64 * args_size,
-                buffers.blend_batches.len() as u32,
-            ),
-            None => {
-                for batch in &buffers.blend_batches {
-                    pass.draw_indexed(
-                        batch.indices.clone(),
-                        batch.base_vertex,
-                        batch.instances.clone(),
-                    );
-                }
-            }
-        }
+        draw_filtered!(&buffers.blend_batches, buffers.opaque_batches.len());
     }
     if params_ready {
         let total = buffers.param_total_count;
-        let translucent = buffers.param_opaque_count..total;
         bind_params!();
         pass.set_render_pipeline(param_blend_pipeline.unwrap());
-        if !translucent.is_empty() {
-            pass.draw_indexed(0..ARC_INTERIOR_INDEX_COUNT, 0, translucent);
+        for (range, layer) in &buffers.param_layer_runs {
+            let run = range.start.max(buffers.param_opaque_count)..range.end.min(total);
+            if run.start < run.end && layer_table.visible(*layer, &view_mask) {
+                pass.draw_indexed(0..ARC_INTERIOR_INDEX_COUNT, 0, run);
+            }
         }
         // Fringes for every parametric instance.
         let index_count: u32 = (64 * 6) + (64 * 12) + 12;
-        pass.draw_indexed(ARC_INTERIOR_INDEX_COUNT..index_count, 0, 0..total);
+        for (range, layer) in &buffers.param_layer_runs {
+            if layer_table.visible(*layer, &view_mask) {
+                pass.draw_indexed(ARC_INTERIOR_INDEX_COUNT..index_count, 0, range.clone());
+            }
+        }
     }
 
     pass_span.end(&mut pass);

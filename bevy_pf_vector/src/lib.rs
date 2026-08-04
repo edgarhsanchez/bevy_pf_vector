@@ -4,13 +4,18 @@
 //! so paths are tessellated once (lyon) and redrawn as GPU-instanced geometry.
 //! Read ARCHITECTURE.md before extending this.
 
+pub mod painter;
 pub mod path;
 pub mod render;
 pub mod tess;
 
 use bevy::prelude::*;
 
-pub use path::{LineCap, LineJoin, PathCommand, PathStyle, StrokeStyle};
+pub use painter::{PainterConfig, VectorPainter, VectorPainterQueue};
+pub use path::{
+    Brush, DashPattern, FillRule, GradientStop, LineCap, LineJoin, PathCommand, PathStyle,
+    StrokeStyle,
+};
 
 /// Flat 2D transform for HUD elements. Use INSTEAD of animating `Transform`:
 /// entities animated through this component never dirty the transform
@@ -104,6 +109,10 @@ pub struct PfVectorPlugin;
 
 impl Plugin for PfVectorPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(render::VectorRenderPlugin);
+        app.init_resource::<painter::VectorPainterQueue>()
+            // Cleared at the top of the frame so `Update`-schedule painting
+            // is what the following extract sees.
+            .add_systems(First, painter::clear_painter_queue)
+            .add_plugins(render::VectorRenderPlugin);
     }
 }
