@@ -541,6 +541,7 @@ impl GeometryCache {
 /// Where an instance's triangles live: the persistent tessellate-once cache,
 /// or this frame's transient region (shapes whose path changed this frame).
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // `Dynamic` is retained: see the cache note in `push_shape`.
 enum GeometryRef {
     Cached(u64),
     Dynamic(GeometryRange),
@@ -569,6 +570,11 @@ pub struct ExtractedShapes {
 }
 
 impl ExtractedShapes {
+    /// Retained alongside `GeometryRef::Dynamic`: with the cache now consulted
+    /// for changed shapes, nothing routes here, but a path that morphs every
+    /// frame still wants a transient region rather than a cache entry per
+    /// frame. Re-wiring that needs a "has this key churned?" signal.
+    #[allow(dead_code)]
     fn append_dynamic(&mut self, geometry: tess::TessellatedGeometry) -> GeometryRange {
         let base_vertex = self.dynamic_vertices.len() as i32;
         self.dynamic_vertices.extend(geometry.vertices.iter().map(|v| GpuVertex {
@@ -951,9 +957,11 @@ fn push_shape(
     clips: &ExtractedClips,
     commands: &[crate::path::PathCommand],
     style: &crate::path::PathStyle,
-    // True on the frame a path/style mutates (and on spawn); those shapes
-    // skip the cache entirely this frame.
-    dynamic: bool,
+    // True on the frame a path/style mutates (and on spawn). No longer
+    // selects a code path — see the cache note below — but kept in the
+    // signature because the transient region it used to select is still the
+    // right answer for genuinely morphing geometry.
+    _dynamic: bool,
     linear: [f32; 4],
     translation: [f32; 2],
     z: f32,
@@ -967,14 +975,21 @@ fn push_shape(
     {
         if let Some(brush) = &style.fill {
             let rule = style.fill_rule;
-            let geometry = if dynamic {
-                tess::tessellate_fill(commands, rule)
-                    .map(|g| GeometryRef::Dynamic(extracted.append_dynamic(g)))
-            } else {
-                let key = tess::fill_key(commands, rule);
-                cache.ensure(key, || tess::tessellate_fill(commands, rule));
-                Some(GeometryRef::Cached(key))
-            };
+            // Content-hash and consult the cache even when the component
+            // changed. Bevy's change detection is per-COMPONENT, so editing a
+            // colour marks the whole `VectorShape` changed — and treating
+            // "changed" as "new topology" re-tessellates an identical path
+            // every frame. That is the dominant UI case (a `Fill` bound to
+            // data) and it measured ~2x SLOWER than CPU rasterization in
+            // bevy_pf's shape backend before this fix.
+            //
+            // A genuinely new path still tessellates, and because the cache is
+            // content-addressed it stores one entry per distinct geometry; the
+            // epoch flush in `extract_shapes` caps growth for paths that morph
+            // every frame.
+            let key = tess::fill_key(commands, rule);
+            cache.ensure(key, || tess::tessellate_fill(commands, rule));
+            let geometry = Some(GeometryRef::Cached(key));
             if let Some(geometry) = geometry {
                 let (color, brush_params, brush_meta) = resolve_brush(brush, atlas);
                 extracted.items.push(ExtractedInstance {
@@ -994,14 +1009,10 @@ fn push_shape(
             }
         }
         if let Some(stroke) = &style.stroke {
-            let geometry = if dynamic {
-                tess::tessellate_stroke(commands, stroke)
-                    .map(|g| GeometryRef::Dynamic(extracted.append_dynamic(g)))
-            } else {
-                let key = tess::stroke_key(commands, stroke);
-                cache.ensure(key, || tess::tessellate_stroke(commands, stroke));
-                Some(GeometryRef::Cached(key))
-            };
+            // Cached by content for the same reason as the fill above.
+            let key = tess::stroke_key(commands, stroke);
+            cache.ensure(key, || tess::tessellate_stroke(commands, stroke));
+            let geometry = Some(GeometryRef::Cached(key));
             if let Some(geometry) = geometry {
                 let (color, brush_params, brush_meta) = resolve_brush(&stroke.brush, atlas);
                 extracted.items.push(ExtractedInstance {
