@@ -315,6 +315,66 @@ Vec per changed shape per frame (split path from paint so a colour edit
 touches neither). Until then `vector_gpu` is opt-in and honest: it buys
 GPU headroom and the engine's analytic clipping/gradients, not frame time.
 
+## Scaling: the 1M standard tier (2026-08-04)
+
+`benchmarks/run-suite.ps1` is the standard suite; tiers are
+200 / 1k / 5k / 50k / 1M. One element count can be made to prove either
+conclusion about this design, so the CURVE is the measurement.
+
+**1,000,000 elements, RTX A6000** — vector pass GPU **33.55 ms p50**
+(65.5M clipper invocations, 8.5M fragments), pass-record CPU 2.31 ms,
+but total frame >=250 ms (`cpu_frame_ms` reads exactly 250.000 at every
+percentile: that is Bevy's virtual-time max-delta clamp saturating, not
+a real number).
+
+So at 1M the GPU does its share in 33 ms while ~215 ms goes somewhere
+else on the CPU — extract, sort, batch, and Bevy's own propagation over
+1M entities. **The wall is per-element CPU work, not the renderer.**
+GPU 0.034 us/element vs CPU ~0.215 us/element: 6.4x.
+
+That reframes the optimisation list. SIMD is NOT the lever (measured
+below); parallelising the serial extract + sort is.
+
+## GPU shape backend: the scaling curve (2026-08-04)
+
+Earlier rows in this file concluded the GPU shape backend "does not beat
+CPU". That was measured only at <=200 shapes and was WRONG as a general
+claim. Frame-time p50, animated fills, bevy_pf `shapes_backend_bench`:
+
+| shapes | CPU (tiny-skia) | GPU (engine) | |
+|--------|-----------------|--------------|--|
+| 200    | 0.858           | 0.983        | CPU 1.15x |
+| 1000   | 1.268           | 1.250        | parity |
+| 2000   | 1.759           | 1.474        | GPU 1.19x |
+| 5000   | 4.795           | 2.871        | GPU 1.67x |
+
+Crossover ~1000 shapes: below it the atlas round-trip (extra view, pass,
+per-frame sync) dominates; above it tiny-skia's per-shape rasterization
+does. Both are true; quoting either alone is not.
+
+## SIMD and build options — measured, not assumed (2026-08-04)
+
+- `-C target-cpu=native`: NO improvement. 5000 animated shapes, GPU
+  2.937 vs 2.871 baseline; CPU 5.366 vs 4.795. Both within noise or
+  slightly worse. glam is already SSE2 by default on x86_64, and these
+  loops are not float-math bound — they are allocation, hashing, ECS
+  iteration and memory traffic. Wider vectors do not help that.
+- Release profile is already right (opt-level 3, fat LTO,
+  codegen-units 1, panic=abort in friginrain2).
+- Per-entity content-hash reuse (engine `GeometryKeys`) landed: correct,
+  but measured within run-to-run noise at 5000 static elements, so
+  hashing was not the bottleneck either. Kept because it is strictly
+  less work, not because it showed up.
+
+What is actually left on the table, in order of expected payoff:
+1. Parallelise `extract_shapes` and the draw-order sort (the ~215 us/1k
+   elements of serial CPU work the 1M tier exposes).
+2. Split path from paint in bevy_pf's `shape_to_vector`: a colour
+   animation currently rebuilds and re-hashes the whole command Vec.
+3. Fewer triangles per element (65 per element at 1M; the AA fringe is
+   a large part of that).
+4. Clear only live atlas slots instead of the whole 2048^2.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%

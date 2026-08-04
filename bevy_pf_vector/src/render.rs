@@ -79,6 +79,7 @@ impl Plugin for VectorRenderPlugin {
             .init_resource::<ExtractedParametrics>()
             .init_resource::<ExtractedClips>()
             .init_resource::<LayerTable>()
+            .init_resource::<GeometryKeys>()
             .init_resource::<GradientAtlas>()
             .init_resource::<VectorBuffers>()
             .init_resource::<VectorViewBindGroups>()
@@ -164,6 +165,15 @@ fn pack_clip(start: u32, count: u32) -> f32 {
 pub struct ExtractedClips {
     entries: Vec<GpuClip>,
     chains: HashMap<Entity, (u32, u32)>,
+}
+
+/// Content-hash keys per shape entity, so an unchanged shape never re-hashes
+/// its path. Hashing every path every frame was the steady-state cost of the
+/// extract loop — for a mostly-static HUD, which is the workload this engine
+/// exists for, it dominated everything else it does per frame.
+#[derive(Resource, Default)]
+pub struct GeometryKeys {
+    keys: HashMap<Entity, (Option<u64>, Option<u64>)>,
 }
 
 /// Per-frame interned `RenderLayers` masks. Instances and batches carry a
@@ -861,12 +871,24 @@ fn pack_color(color: LinearRgba) -> [u8; 4] {
 fn extract_shapes(
     shapes: Extract<
         Query<
-            (Ref<VectorShape>, &GlobalTransform, Option<&ClippedBy>, Option<&RenderLayers>),
+            (
+                Entity,
+                Ref<VectorShape>,
+                &GlobalTransform,
+                Option<&ClippedBy>,
+                Option<&RenderLayers>,
+            ),
             Without<HudTransform>,
         >,
     >,
     flat_shapes: Extract<
-        Query<(Ref<VectorShape>, &HudTransform, Option<&ClippedBy>, Option<&RenderLayers>)>,
+        Query<(
+            Entity,
+            Ref<VectorShape>,
+            &HudTransform,
+            Option<&ClippedBy>,
+            Option<&RenderLayers>,
+        )>,
     >,
     painted: Extract<Res<VectorPainterQueue>>,
     clips: Res<ExtractedClips>,
@@ -874,6 +896,7 @@ fn extract_shapes(
     mut extracted: ResMut<ExtractedShapes>,
     mut atlas: ResMut<GradientAtlas>,
     mut layers: ResMut<LayerTable>,
+    mut keys: ResMut<GeometryKeys>,
 ) {
     extracted.items.clear();
     extracted.dynamic_vertices.clear();
@@ -884,9 +907,15 @@ fn extract_shapes(
     // gets absurd, drop it wholesale and let live shapes re-populate.
     if cache.ranges.len() > 8192 {
         *cache = GeometryCache::default();
+        keys.keys.clear();
+    }
+    // Entities despawn without telling us; keep the key map from growing
+    // without bound in a long session of churn.
+    if keys.keys.len() > 65536 {
+        keys.keys.clear();
     }
 
-    for (shape, transform, clipped, shape_layers) in &shapes {
+    for (entity, shape, transform, clipped, shape_layers) in &shapes {
         let model = transform.to_matrix();
         let linear = [
             model.x_axis.x,
@@ -902,6 +931,8 @@ fn extract_shapes(
             &clips,
             &shape.commands,
             &shape.style,
+            entity,
+            &mut keys,
             shape.is_changed(),
             linear,
             translation,
@@ -910,7 +941,7 @@ fn extract_shapes(
             layers.intern(shape_layers),
         );
     }
-    for (shape, hud, clipped, shape_layers) in &flat_shapes {
+    for (entity, shape, hud, clipped, shape_layers) in &flat_shapes {
         let (linear, translation, z) = hud.decompose();
         push_shape(
             &mut cache,
@@ -919,6 +950,8 @@ fn extract_shapes(
             &clips,
             &shape.commands,
             &shape.style,
+            entity,
+            &mut keys,
             shape.is_changed(),
             linear,
             translation,
@@ -939,7 +972,9 @@ fn extract_shapes(
             &clips,
             &item.commands,
             &item.style,
-            false,
+            Entity::PLACEHOLDER,
+            &mut keys,
+            true,
             item.linear,
             item.translation,
             item.z,
@@ -957,11 +992,12 @@ fn push_shape(
     clips: &ExtractedClips,
     commands: &[crate::path::PathCommand],
     style: &crate::path::PathStyle,
-    // True on the frame a path/style mutates (and on spawn). No longer
-    // selects a code path — see the cache note below — but kept in the
-    // signature because the transient region it used to select is still the
-    // right answer for genuinely morphing geometry.
-    _dynamic: bool,
+    entity: Entity,
+    keys: &mut GeometryKeys,
+    // True on the frame a path/style mutates (and on spawn). Does not select
+    // a tessellation path any more (see the cache note below); it selects
+    // whether the content hash has to be recomputed at all.
+    changed: bool,
     linear: [f32; 4],
     translation: [f32; 2],
     z: f32,
@@ -975,6 +1011,11 @@ fn push_shape(
     {
         if let Some(brush) = &style.fill {
             let rule = style.fill_rule;
+            // Reuse the previous content hash when nothing changed. Hashing
+            // is the whole steady-state cost of this loop for a static HUD,
+            // and re-deriving an identical key every frame for thousands of
+            // unchanged shapes is pure waste.
+            //
             // Content-hash and consult the cache even when the component
             // changed. Bevy's change detection is per-COMPONENT, so editing a
             // colour marks the whole `VectorShape` changed — and treating
@@ -987,7 +1028,17 @@ fn push_shape(
             // content-addressed it stores one entry per distinct geometry; the
             // epoch flush in `extract_shapes` caps growth for paths that morph
             // every frame.
-            let key = tess::fill_key(commands, rule);
+            let cached = (!changed)
+                .then(|| keys.keys.get(&entity).and_then(|k| k.0))
+                .flatten();
+            let key = match cached {
+                Some(key) => key,
+                None => {
+                    let key = tess::fill_key(commands, rule);
+                    keys.keys.entry(entity).or_default().0 = Some(key);
+                    key
+                }
+            };
             cache.ensure(key, || tess::tessellate_fill(commands, rule));
             let geometry = Some(GeometryRef::Cached(key));
             if let Some(geometry) = geometry {
@@ -1009,8 +1060,19 @@ fn push_shape(
             }
         }
         if let Some(stroke) = &style.stroke {
-            // Cached by content for the same reason as the fill above.
-            let key = tess::stroke_key(commands, stroke);
+            // Cached by content, and by entity, for the same reasons as the
+            // fill above.
+            let cached = (!changed)
+                .then(|| keys.keys.get(&entity).and_then(|k| k.1))
+                .flatten();
+            let key = match cached {
+                Some(key) => key,
+                None => {
+                    let key = tess::stroke_key(commands, stroke);
+                    keys.keys.entry(entity).or_default().1 = Some(key);
+                    key
+                }
+            };
             cache.ensure(key, || tess::tessellate_stroke(commands, stroke));
             let geometry = Some(GeometryRef::Cached(key));
             if let Some(geometry) = geometry {
