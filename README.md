@@ -73,8 +73,13 @@ renderer cost:
 | engine renderer cost (GPU pass + record + prepare) | ~0.015 ms | ~0.19 ms |
 
 Renderer-for-renderer the engine is roughly an order of magnitude faster at
-both scales, and our entire Bevy frame at 5000 elements (1.66 ms, ECS and
-all) matches rive's render-only loop (1.72 ms). Rive pays per-frame path
+both scales, and our entire Bevy frame at 5000 elements (1.45 ms, ECS and
+all — after layout-fingerprint caching made prepare a pure gather and the
+benchmark client's animation went parallel; control measured with the same
+client at 3.31 ms) beats rive's render-only loop (1.72 ms). The dominant
+remaining frame cost is Bevy's transform propagation, not the renderer —
+the next lever is an opt-in flat HUD transform path that bypasses the
+hierarchy, plus change-detection extraction for mostly-static HUDs. Rive pays per-frame path
 processing and flush work by design — the cost this engine's
 tessellate-once model eliminates. Caveats: rive numbers are frame-time (its
 loop is render-only, but CPU/GPU overlap means GPU-only could be lower);

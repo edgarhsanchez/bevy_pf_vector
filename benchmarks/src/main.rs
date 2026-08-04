@@ -428,13 +428,15 @@ fn animate(mut frame: ResMut<FrameCount>, mut query: Query<(&Animated, &mut Tran
     frame.0 += 1;
     // Virtual time: 1/120 s per frame regardless of real frame rate.
     let t = frame.0 as f32 / 120.0;
-    for (anim, mut transform) in &mut query {
+    // Parallel across the compute pool — the animation is the benchmark
+    // client's cost and applies identically to every backend.
+    query.par_iter_mut().for_each(|(anim, mut transform)| {
         let angle = anim.base_rotation + 0.35 * ops::sin(t * anim.speed + anim.phase);
         let scale = anim.base_scale * (1.0 + 0.05 * ops::sin(t * anim.speed * 1.7 + anim.phase));
         *transform = Transform::from_translation(anim.translation)
             .with_rotation(Quat::from_rotation_z(angle))
             .with_scale(Vec3::splat(scale));
-    }
+    });
 }
 
 // ---------------------------------------------------------------- metrics

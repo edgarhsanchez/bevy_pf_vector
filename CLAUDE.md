@@ -107,8 +107,17 @@ from any reference renderer:
 
 ## Next tasks
 
+- Bevy-overhead levers (renderer is no longer the frame bottleneck at 5000
+  el — 1.45 ms frame vs 0.137 ms GPU): opt-in flat `HudTransform` component
+  bypassing Transform/GlobalTransform propagation for non-hierarchical HUD
+  entities; change-detection extraction + persistent instance slots for
+  mostly-static HUDs. Prepare already skips sort/batch/indirect rebuilds
+  via a layout fingerprint (rebuilds only when count/geometry/z/opacity
+  change); upstreaming a static-transform fast path to Bevy is the
+  long-term "fix Bevy" option.
 - Workloads 2-4 (animated params, clip stress, stroke stress) in the
-  benchmark suite — vello backend already wired as the opponent.
+  benchmark suite — vello backend already wired as the opponent, rive
+  native harness patch reusable for both.
 - Style-change handling (VectorShape color changes without re-tessellation
   — currently color is per-instance so it works, but path edits leak old
   geometry in the cache; add eviction).

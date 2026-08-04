@@ -226,6 +226,13 @@ pub struct VectorBuffers {
     opaque_batches: Vec<VectorBatch>,
     blend_batches: Vec<VectorBatch>,
     use_multi_draw: bool,
+    /// Hash of the layout-affecting fields (count, geometry, z, opacity) of
+    /// the extracted set. While it holds steady — the common HUD case, where
+    /// only transforms/colors animate — sorting, batching, and indirect-args
+    /// building are all skipped and instances upload through `permutation`.
+    layout_fingerprint: u64,
+    /// Extracted-item index for each instance slot, in draw order.
+    permutation: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -429,17 +436,58 @@ fn prepare_vector_buffers(
         cache.dirty = false;
     }
 
+    // Layout fingerprint: when the structure is unchanged, the cached batch
+    // lists, indirect args, and draw-order permutation all remain valid, and
+    // per-frame CPU collapses to a gather + one buffer write.
+    let fingerprint = {
+        let mut hasher = std::hash::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        extracted.0.len().hash(&mut hasher);
+        for item in &extracted.0 {
+            item.geometry.hash(&mut hasher);
+            item.z.to_bits().hash(&mut hasher);
+            item.opaque.hash(&mut hasher);
+        }
+        hasher.finish()
+    };
+
+    let gpu_instance = |item: &ExtractedInstance| GpuInstance {
+        linear: item.linear,
+        translation_z: [item.translation[0], item.translation[1], item.z, 0.0],
+        color: item.color,
+    };
+
+    if fingerprint == buffers.layout_fingerprint && !buffers.permutation.is_empty() {
+        // Fast path: transforms/colors changed at most — gather in cached
+        // draw order and upload.
+        let instances: Vec<GpuInstance> = buffers
+            .permutation
+            .iter()
+            .map(|&i| gpu_instance(&extracted.0[i as usize]))
+            .collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&instances);
+        if let Some(buffer) = &buffers.instance {
+            if buffers.instance_capacity >= bytes.len() {
+                queue.write_buffer(buffer, 0, bytes);
+                return;
+            }
+        }
+        // Capacity lost somehow — fall through to a full rebuild.
+    }
+    buffers.layout_fingerprint = fingerprint;
+    buffers.permutation.clear();
     buffers.opaque_batches.clear();
     buffers.blend_batches.clear();
 
     let mut instances: Vec<GpuInstance> = Vec::with_capacity(extracted.0.len() * 2);
-    let push_instance = |instances: &mut Vec<GpuInstance>, item: &ExtractedInstance| -> u32 {
+    let mut push_instance = |instances: &mut Vec<GpuInstance>,
+                             permutation: &mut Vec<u32>,
+                             item_index: usize,
+                             item: &ExtractedInstance|
+     -> u32 {
         let index = instances.len() as u32;
-        instances.push(GpuInstance {
-            linear: item.linear,
-            translation_z: [item.translation[0], item.translation[1], item.z, 0.0],
-            color: item.color,
-        });
+        instances.push(gpu_instance(item));
+        permutation.push(item_index as u32);
         index
     };
 
@@ -460,7 +508,7 @@ fn prepare_vector_buffers(
         if range.interior_count == 0 {
             continue;
         }
-        let index = push_instance(&mut instances, item);
+        let index = push_instance(&mut instances, &mut buffers.permutation, item_index, item);
         if last_geometry == Some(item.geometry) {
             buffers.opaque_batches.last_mut().unwrap().instances.end = index + 1;
         } else {
@@ -499,7 +547,7 @@ fn prepare_vector_buffers(
         if count == 0 {
             continue;
         }
-        let index = push_instance(&mut instances, item);
+        let index = push_instance(&mut instances, &mut buffers.permutation, item_index, item);
         if last_key == Some((item.geometry, is_fringe)) {
             buffers.blend_batches.last_mut().unwrap().instances.end = index + 1;
         } else {
