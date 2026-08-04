@@ -65,6 +65,22 @@ pub struct PainterConfig {
     pub render_layers: Option<RenderLayers>,
     pub cap: LineCap,
     pub join: LineJoin,
+
+    // --- stateful mode -----------------------------------------------------
+    // The retained methods below (`fill_rect`, `stroke_circle`, ...) take
+    // their paint explicitly. These fields drive the ALTERNATIVE stateful
+    // primitives (`rect`, `circle`, `ngon`, ...), which exist so a codebase
+    // written against an immediate-mode painter of the
+    // set-state-then-draw kind ports by swapping the parameter type rather
+    // than rewriting every call site.
+    /// Paint for the stateful primitives.
+    pub color: Color,
+    /// `true` strokes the outline, `false` fills.
+    pub hollow: bool,
+    /// Stroke width for the stateful primitives, in physical screen pixels
+    /// (matching the convention HUD code written against `ThicknessType::Pixels`
+    /// already assumes).
+    pub thickness: f32,
 }
 
 impl Default for PainterConfig {
@@ -74,6 +90,9 @@ impl Default for PainterConfig {
             render_layers: None,
             cap: LineCap::Butt,
             join: LineJoin::Miter,
+            color: Color::WHITE,
+            hollow: false,
+            thickness: 1.0,
         }
     }
 }
@@ -235,10 +254,119 @@ impl VectorPainter<'_, '_> {
         self.push(mid, commands, PathStyle::stroke(stroke));
     }
 
+    // ---------------------------------------------------------------- state
+    // Stateful primitives: position and paint come from the config, so a
+    // caller does `set_translation(..); color = ..; rect(size)`.
+
+    /// Stateful arc: a ring of the current `thickness` centred on `radius`,
+    /// swept from `start` to `end` (radians, clockwise from +Y — the
+    /// convention the HUD code this mirrors uses).
+    pub fn arc(&mut self, radius: f32, start: f32, end: f32) {
+        let (color, _, thickness) = self.paint();
+        let inner = (radius - thickness * 0.5).max(0.0);
+        let outer = radius + thickness * 0.5;
+        let engine_start = std::f32::consts::FRAC_PI_2 - start;
+        self.ring(Vec2::ZERO, inner, outer, engine_start, start - end, color);
+    }
+
+    /// No-op: this painter is always 2D. Present so code written against a
+    /// painter that supports both modes ports without edits.
+    pub fn set_2d(&mut self) {}
+
+    /// Move the painter's origin.
+    pub fn set_translation(&mut self, translation: Vec3) {
+        self.config.transform.translation = translation;
+    }
+
+    /// Set the painter's rotation. Only the Z component affects 2D output.
+    pub fn set_rotation(&mut self, rotation: Quat) {
+        self.config.transform.rotation = rotation;
+    }
+
+    /// Rotate around Z, in radians.
+    pub fn set_rotation_z(&mut self, radians: f32) {
+        self.config.transform.rotation = Quat::from_rotation_z(radians);
+    }
+
+    pub fn set_color(&mut self, color: Color) {
+        self.config.color = color;
+    }
+
+    /// Rectangle centred on the painter origin, filled or stroked per
+    /// `hollow`.
+    pub fn rect(&mut self, size: Vec2) {
+        let (color, hollow, thickness) = self.paint();
+        if hollow {
+            self.stroke_rect(Vec2::ZERO, size, thickness, color);
+        } else {
+            self.fill_rect(Vec2::ZERO, size, color);
+        }
+    }
+
+    /// Circle centred on the painter origin.
+    pub fn circle(&mut self, radius: f32) {
+        let (color, hollow, thickness) = self.paint();
+        if hollow {
+            self.stroke_circle(Vec2::ZERO, radius, thickness, color);
+        } else {
+            self.fill_circle(Vec2::ZERO, radius, color);
+        }
+    }
+
+    /// Regular polygon with `sides` sides, centred on the painter origin.
+    /// First vertex points +Y, matching the usual convention.
+    pub fn ngon(&mut self, sides: f32, radius: f32) {
+        let n = (sides.round() as usize).max(3);
+        let commands = ngon_commands(n, radius);
+        let (color, hollow, thickness) = self.paint();
+        if hollow {
+            let stroke = StrokeStyle { width: thickness, ..self.stroke_style(color.to_linear(), thickness) };
+            self.push(Vec2::ZERO, commands, PathStyle::stroke(stroke));
+        } else {
+            self.push(Vec2::ZERO, commands, PathStyle::fill(color.to_linear()));
+        }
+    }
+
+    /// Triangle with painter-local vertices, filled or stroked per `hollow`.
+    pub fn triangle(&mut self, a: Vec2, b: Vec2, c: Vec2) {
+        let (color, hollow, thickness) = self.paint();
+        if hollow {
+            let centroid = (a + b + c) / 3.0;
+            let commands = vec![
+                PathCommand::MoveTo(a - centroid),
+                PathCommand::LineTo(b - centroid),
+                PathCommand::LineTo(c - centroid),
+                PathCommand::Close,
+            ];
+            let stroke = self.stroke_style(color.to_linear(), thickness);
+            self.push(centroid, commands, PathStyle::stroke(stroke));
+        } else {
+            self.fill_triangle(a, b, c, color);
+        }
+    }
+
+    /// Stateful line between two painter-local points. Takes `Vec3` because
+    /// the callers this exists for work in 3D HUD space; z is ignored beyond
+    /// the painter's own depth.
+    pub fn line_3d(&mut self, start: Vec3, end: Vec3) {
+        let (color, _, thickness) = self.paint();
+        self.line(start.truncate(), end.truncate(), thickness, color);
+    }
+
+    /// Current paint, with thickness converted from screen pixels to the
+    /// world units the geometry is authored in.
+    fn paint(&self) -> (Color, bool, f32) {
+        (
+            self.config.color,
+            self.config.hollow,
+            self.screen_px(self.config.thickness),
+        )
+    }
+
     /// Ring segment (the parametric fast path — no tessellation, one
     /// instance write). Angles in radians, counter-clockwise from +X;
     /// negative `sweep` draws clockwise.
-    pub fn arc(
+    pub fn ring(
         &mut self,
         center: Vec2,
         inner: f32,
@@ -286,4 +414,21 @@ fn circle_commands(radius: f32) -> Vec<PathCommand> {
         PathCommand::CubicTo { ctrl1: Vec2::new(k, -r), ctrl2: Vec2::new(r, -k), to: Vec2::new(r, 0.0) },
         PathCommand::Close,
     ]
+}
+
+fn ngon_commands(sides: usize, radius: f32) -> Vec<PathCommand> {
+    let mut commands = Vec::with_capacity(sides + 2);
+    for i in 0..sides {
+        // Start at +Y and go clockwise, which is what regular-polygon HUD
+        // markers (hexes, triangles) are drawn assuming.
+        let a = std::f32::consts::FRAC_PI_2 - (i as f32 / sides as f32) * std::f32::consts::TAU;
+        let p = Vec2::new(a.cos() * radius, a.sin() * radius);
+        if i == 0 {
+            commands.push(PathCommand::MoveTo(p));
+        } else {
+            commands.push(PathCommand::LineTo(p));
+        }
+    }
+    commands.push(PathCommand::Close);
+    commands
 }
