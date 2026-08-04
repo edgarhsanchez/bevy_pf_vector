@@ -483,6 +483,41 @@ REMAINING:
   answer: a minimap and skill-tree canvas are per-frame vector drawing,
   not stock controls.
 
+## THE LIMIT OF TESSELLATE-ONCE (2026-08-04) — learned the hard way
+
+Porting friginrain_hud (in-world minimap/skill tree/hud_edit) to the
+immediate-mode painter took the game from 100+ FPS to ~20 with heavy
+blinking. Reverted.
+
+This is a DESIGN mismatch, not a bug, and it bounds where this engine
+should be used:
+
+- The engine tessellates once, keyed by geometry CONTENT. Steady state is
+  one instance write per shape — a huge win for shapes whose SIZE is
+  stable while transform/colour animate.
+- An in-world HUD is the opposite: bars, arcs and blips whose SIZE
+  changes every frame. Every frame mints new geometry keys, the cache
+  grows, hits the flush threshold, is wiped, and everything
+  re-tessellates. A tessellation storm; the blinking is the churn.
+- `bevy_vector_shapes` draws SDF primitives, so arbitrary sizes cost it
+  no tessellation. For that content it is the better tool.
+
+The engine's own answer already exists and is the pattern to extend:
+`VectorPrimitive::Arc` computes geometry in the VERTEX SHADER from
+per-instance params, so animating it is one instance write and zero
+tessellation. Rect, rounded-rect, circle and line need the same treatment
+before any immediate-mode HUD belongs on this painter.
+
+Rule of thumb until then: static or transform-animated content -> this
+engine. Per-frame size-varying primitives -> SDF, or a parametric
+primitive if one exists.
+
+Also off for now: the bevy_pf `vector_gpu` atlas backend in friginrain2
+(missing borders, blinking, layout shift). Feature-gated, still builds.
+Before it returns, `shapes_gpu_check` must exercise shapes ACROSS FRAMES
+with resize and remount — screenshotting one settled frame is what let all
+of this through.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
