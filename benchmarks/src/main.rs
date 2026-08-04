@@ -1036,6 +1036,16 @@ fn main() {
     )
     .add_plugins(RenderDiagnosticsPlugin)
     .add_plugins(Shape2dPlugin::default())
+    // Bevy clamps virtual time to 250 ms per frame by default, so any tier
+    // slower than 4 FPS reports exactly 250.000 at every percentile — a
+    // saturated reading that looks like data. The top-end tiers (200k, 1M)
+    // are all slower than that, so raise the ceiling far past anything we
+    // will measure.
+    .insert_resource({
+        let mut time = Time::<Virtual>::default();
+        time.set_max_delta(std::time::Duration::from_secs(60));
+        time
+    })
     .insert_resource(cfg.clone())
     .init_resource::<FrameCount>()
     .init_resource::<BenchState>()

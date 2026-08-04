@@ -408,6 +408,43 @@ and an instance push. Parallelising it — per-thread instance buffers
 concatenated after — is the single highest-value change left in the
 engine.
 
+## THE EPOCH-FLUSH BUG (2026-08-04) — found by the 1M tier
+
+The single worst bug in the engine so far, invisible for the whole
+project because every benchmark tier was too small to trigger it.
+
+`extract_shapes` flushed the whole geometry cache when it exceeded a
+FIXED 8192 entries. That threshold is not "the cache got absurd", it is
+"the scene got big". Any scene with more than 8192 DISTINCT geometries
+wiped the cache every frame and re-tessellated everything, inverting the
+engine's central bet — tessellate once, instance forever — into
+tessellate-everything-every-frame.
+
+The harness randomises each element's size, so every element is a
+distinct geometry. At 200/5000 elements the cache stays under the cap
+and all previous numbers were honest. At 200k it flushed every frame.
+
+Fixed: the threshold now scales with the working set,
+`8192.max(live_last * 4)`, so a flush means "mostly garbage", not
+"large scene".
+
+| tier | before | after | GPU after |
+|------|--------|-------|-----------|
+| 200,000 | 972 ms/frame | **47.8 ms** | 13.95 ms |
+| 1,000,000 | ~4.9 s (est) | **289 ms** | 52.9 ms |
+
+20x at 200k, ~17x at 1M. Also fixed: the harness let Bevy clamp virtual
+time to 250 ms, so every tier slower than 4 FPS reported exactly
+250.000 at every percentile — a saturated reading that looks like data.
+`Time::<Virtual>::max_delta` is now 60 s.
+
+After the fix, 1M is 289 ms frame against 52.9 ms GPU, i.e. ~236 ms of
+CPU for 1M elements = 0.24 us/element. THAT is the real per-element
+extract cost, and parallelising `extract_shapes` is what attacks it.
+
+Lesson worth keeping: this bug was only reachable by testing far beyond
+the intended workload. The suite tiers to 1M for exactly this reason.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%

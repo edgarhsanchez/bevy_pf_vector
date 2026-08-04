@@ -898,14 +898,31 @@ fn extract_shapes(
     mut layers: ResMut<LayerTable>,
     mut keys: ResMut<GeometryKeys>,
 ) {
+    // Live shape count from last frame, read before the clear: the epoch
+    // flush below needs to know the working-set size.
+    let live_last = extracted.items.len();
+
     extracted.items.clear();
     extracted.dynamic_vertices.clear();
     extracted.dynamic_indices.clear();
     layers.clear();
 
-    // Epoch flush: mutation churn appends new cache entries; when the cache
-    // gets absurd, drop it wholesale and let live shapes re-populate.
-    if cache.ranges.len() > 8192 {
+    // Epoch flush: mutation churn appends cache entries that nothing draws
+    // any more, so the cache is dropped wholesale once it is mostly garbage.
+    //
+    // The threshold MUST scale with the working set. A fixed cap (this was
+    // 8192) is not "the cache got absurd", it is "the scene got big": a scene
+    // with more distinct geometries than the cap wipes the cache EVERY FRAME
+    // and re-tessellates everything, turning the engine's central bet — one
+    // tessellation, then instancing forever — into its opposite. That is
+    // invisible at 200-5000 elements and catastrophic at 200k (measured:
+    // 972 ms/frame against 18 ms of GPU).
+    //
+    // Flushing only when the cache dwarfs what is actually on screen keeps
+    // the original intent (bound garbage from paths that morph every frame)
+    // without punishing scenes that legitimately hold many distinct shapes.
+    let flush_at = 8192.max(live_last.saturating_mul(4));
+    if cache.ranges.len() > flush_at {
         *cache = GeometryCache::default();
         keys.keys.clear();
     }
@@ -1032,14 +1049,19 @@ fn push_shape(
                 .then(|| keys.keys.get(&entity).and_then(|k| k.0))
                 .flatten();
             let key = match cached {
+                // A key in the per-entity map was `ensure`d when it was
+                // computed, and the two maps are cleared together, so the
+                // geometry is already resident: skip the second hash lookup.
+                // That halves the per-shape map traffic in steady state, and
+                // map traffic is what `extract_shapes` spends its time on.
                 Some(key) => key,
                 None => {
                     let key = tess::fill_key(commands, rule);
                     keys.keys.entry(entity).or_default().0 = Some(key);
+                    cache.ensure(key, || tess::tessellate_fill(commands, rule));
                     key
                 }
             };
-            cache.ensure(key, || tess::tessellate_fill(commands, rule));
             let geometry = Some(GeometryRef::Cached(key));
             if let Some(geometry) = geometry {
                 let (color, brush_params, brush_meta) = resolve_brush(brush, atlas);
@@ -1066,14 +1088,15 @@ fn push_shape(
                 .then(|| keys.keys.get(&entity).and_then(|k| k.1))
                 .flatten();
             let key = match cached {
+                // Already resident — see the fill above.
                 Some(key) => key,
                 None => {
                     let key = tess::stroke_key(commands, stroke);
                     keys.keys.entry(entity).or_default().1 = Some(key);
+                    cache.ensure(key, || tess::tessellate_stroke(commands, stroke));
                     key
                 }
             };
-            cache.ensure(key, || tess::tessellate_stroke(commands, stroke));
             let geometry = Some(GeometryRef::Cached(key));
             if let Some(geometry) = geometry {
                 let (color, brush_params, brush_meta) = resolve_brush(&stroke.brush, atlas);
