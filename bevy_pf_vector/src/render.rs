@@ -49,16 +49,24 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
 use bevy::shader::Shader;
 
 use crate::tess;
-use crate::VectorShape;
+use crate::{VectorPrimitive, VectorShape};
 
 pub const VECTOR_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("7a3f1c2e-9b4d-4b8a-a2f0-5e1d3c6b9f01");
+pub const VECTOR_PARAM_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("2c8e5b1a-4f7d-4c3e-9a06-8b21d75c4e90");
 
 pub struct VectorRenderPlugin;
 
 impl Plugin for VectorRenderPlugin {
     fn build(&self, app: &mut App) {
         load_internal_asset!(app, VECTOR_SHADER_HANDLE, "vector.wgsl", Shader::from_wgsl);
+        load_internal_asset!(
+            app,
+            VECTOR_PARAM_SHADER_HANDLE,
+            "vector_param.wgsl",
+            Shader::from_wgsl
+        );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -66,15 +74,17 @@ impl Plugin for VectorRenderPlugin {
         render_app
             .init_resource::<GeometryCache>()
             .init_resource::<ExtractedShapes>()
+            .init_resource::<ExtractedParametrics>()
             .init_resource::<VectorBuffers>()
             .init_resource::<VectorViewBindGroups>()
             .init_resource::<VectorPipeline>()
-            .add_systems(ExtractSchedule, extract_shapes)
+            .add_systems(ExtractSchedule, (extract_shapes, extract_primitives))
             .add_systems(
                 Render,
                 (
                     queue_vector_pipelines.in_set(RenderSystems::Queue),
                     prepare_vector_buffers.in_set(RenderSystems::PrepareResources),
+                    prepare_parametrics.in_set(RenderSystems::PrepareResources),
                     prepare_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
@@ -102,6 +112,109 @@ struct GpuInstance {
     translation_z: [f32; 4],
     color: [u8; 4],
 }
+
+/// 52 bytes: the tessellated-instance fields plus the primitive parameters
+/// ([start, sweep, inner, outer] for arcs).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuParamInstance {
+    linear: [f32; 4],
+    translation_z: [f32; 4],
+    color: [u8; 4],
+    params: [f32; 4],
+}
+
+fn param_instance_buffer_layout() -> VertexBufferLayout {
+    let mut layout = VertexBufferLayout::from_vertex_formats(
+        VertexStepMode::Instance,
+        [
+            VertexFormat::Float32x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Unorm8x4,
+            VertexFormat::Float32x4,
+        ],
+    );
+    for (i, attribute) in layout.attributes.iter_mut().enumerate() {
+        attribute.shader_location = 3 + i as u32;
+    }
+    layout
+}
+
+/// Canonical arc strip: vertices encode (t, side) + fringe directions; the
+/// vertex shader turns them into ring-segment geometry per instance.
+/// Returns (vertices, indices, interior_index_count) with fringe indices
+/// following the interior ones.
+fn canonical_arc_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
+    const SEGMENTS: u32 = 64;
+    let n = SEGMENTS;
+    let mut vertices = Vec::with_capacity((4 * (n + 1) + 4) as usize);
+    // Interior: inner/outer pair per step, full coverage, no fringe.
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        for side in [0.0f32, 1.0] {
+            vertices.push(GpuVertex { position: [t, side], normal: [0.0, 0.0], coverage: 1.0 });
+        }
+    }
+    // Fringe rings: outer edge displaces +radial, inner edge -radial.
+    let outer_ring = vertices.len() as u32;
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        vertices.push(GpuVertex { position: [t, 1.0], normal: [1.0, 0.0], coverage: 0.0 });
+    }
+    let inner_ring = vertices.len() as u32;
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        vertices.push(GpuVertex { position: [t, 0.0], normal: [-1.0, 0.0], coverage: 0.0 });
+    }
+    // End caps displace tangentially (backward at t=0, forward at t=1).
+    let caps = vertices.len() as u32;
+    vertices.push(GpuVertex { position: [0.0, 0.0], normal: [0.0, -1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [0.0, 1.0], normal: [0.0, -1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [1.0, 0.0], normal: [0.0, 1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [1.0, 1.0], normal: [0.0, 1.0], coverage: 0.0 });
+
+    let (inner_at, outer_at) = (|i: u32| i * 2, |i: u32| i * 2 + 1);
+    let mut indices = Vec::new();
+    for i in 0..n {
+        indices.extend_from_slice(&[
+            inner_at(i),
+            outer_at(i),
+            inner_at(i + 1),
+            inner_at(i + 1),
+            outer_at(i),
+            outer_at(i + 1),
+        ]);
+    }
+    // Fringe indices follow the interior block.
+    for i in 0..n {
+        indices.extend_from_slice(&[
+            outer_at(i),
+            outer_ring + i,
+            outer_at(i + 1),
+            outer_at(i + 1),
+            outer_ring + i,
+            outer_ring + i + 1,
+        ]);
+        indices.extend_from_slice(&[
+            inner_ring + i,
+            inner_at(i),
+            inner_ring + i + 1,
+            inner_ring + i + 1,
+            inner_at(i),
+            inner_at(i + 1),
+        ]);
+    }
+    indices.extend_from_slice(&[
+        inner_at(0), caps, outer_at(0), outer_at(0), caps, caps + 1,
+    ]);
+    indices.extend_from_slice(&[
+        inner_at(n), caps + 2, outer_at(n), outer_at(n), caps + 2, caps + 3,
+    ]);
+    (vertices, indices)
+}
+
+/// Interior index count of the canonical arc mesh (fringe indices follow).
+const ARC_INTERIOR_INDEX_COUNT: u32 = 64 * 6;
 
 /// Layout-compatible with wgpu's DrawIndexedIndirectArgs.
 #[repr(C)]
@@ -252,6 +365,18 @@ struct VectorBatch {
     instances: Range<u32>,
 }
 
+struct ParamItem {
+    z: f32,
+    linear: [f32; 4],
+    translation: [f32; 2],
+    color: [u8; 4],
+    params: [f32; 4],
+    opaque: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct ExtractedParametrics(Vec<ParamItem>);
+
 #[derive(Resource, Default)]
 pub struct VectorBuffers {
     vertex: Option<Buffer>,
@@ -280,6 +405,14 @@ pub struct VectorBuffers {
     layout_fingerprint: u64,
     /// Extracted-item index for each instance slot, in draw order.
     permutation: Vec<u32>,
+    /// Parametric primitives: canonical mesh (built once) + per-frame
+    /// instances, opaque section first then translucent back-to-front.
+    param_vertex: Option<Buffer>,
+    param_index: Option<Buffer>,
+    param_instance: Option<Buffer>,
+    param_instance_capacity: usize,
+    param_opaque_count: u32,
+    param_total_count: u32,
 }
 
 #[derive(Default)]
@@ -303,6 +436,7 @@ pub struct VectorViewBindGroups {
 pub struct VectorPipeline {
     view_layout: BindGroupLayoutDescriptor,
     variants: HashMap<(TextureFormat, u32, bool), CachedRenderPipelineId>,
+    param_variants: HashMap<(TextureFormat, u32, bool), CachedRenderPipelineId>,
 }
 
 impl Default for VectorPipeline {
@@ -316,6 +450,7 @@ impl Default for VectorPipeline {
                 ),
             ),
             variants: HashMap::new(),
+            param_variants: HashMap::new(),
         }
     }
 }
@@ -374,6 +509,63 @@ impl VectorPipeline {
             })
     }
 
+    fn ensure_param(
+        &mut self,
+        cache: &PipelineCache,
+        format: TextureFormat,
+        samples: u32,
+        opaque: bool,
+    ) -> CachedRenderPipelineId {
+        let view_layout = self.view_layout.clone();
+        *self
+            .param_variants
+            .entry((format, samples, opaque))
+            .or_insert_with(|| {
+                cache.queue_render_pipeline(RenderPipelineDescriptor {
+                    label: Some(
+                        if opaque {
+                            "pf_vector_param_opaque_pipeline"
+                        } else {
+                            "pf_vector_param_blend_pipeline"
+                        }
+                        .into(),
+                    ),
+                    layout: vec![view_layout],
+                    vertex: VertexState {
+                        shader: VECTOR_PARAM_SHADER_HANDLE,
+                        entry_point: Some("vertex".into()),
+                        shader_defs: Vec::new(),
+                        buffers: vec![vertex_buffer_layout(), param_instance_buffer_layout()],
+                    },
+                    fragment: Some(FragmentState {
+                        shader: VECTOR_PARAM_SHADER_HANDLE,
+                        entry_point: Some("fragment".into()),
+                        shader_defs: Vec::new(),
+                        targets: vec![Some(ColorTargetState {
+                            format,
+                            blend: (!opaque).then_some(BlendState::ALPHA_BLENDING),
+                            write_mask: ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: PrimitiveState::default(),
+                    depth_stencil: Some(DepthStencilState {
+                        format: CORE_2D_DEPTH_FORMAT,
+                        depth_write_enabled: Some(opaque),
+                        depth_compare: Some(CompareFunction::GreaterEqual),
+                        stencil: StencilState::default(),
+                        bias: DepthBiasState::default(),
+                    }),
+                    multisample: MultisampleState {
+                        count: samples,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    immediate_size: 0,
+                    zero_initialize_workgroup_memory: false,
+                })
+            })
+    }
+
     fn get(
         &self,
         format: TextureFormat,
@@ -381,6 +573,15 @@ impl VectorPipeline {
         opaque: bool,
     ) -> Option<CachedRenderPipelineId> {
         self.variants.get(&(format, samples, opaque)).copied()
+    }
+
+    fn get_param(
+        &self,
+        format: TextureFormat,
+        samples: u32,
+        opaque: bool,
+    ) -> Option<CachedRenderPipelineId> {
+        self.param_variants.get(&(format, samples, opaque)).copied()
     }
 }
 
@@ -479,8 +680,31 @@ fn queue_vector_pipelines(
     views: Query<(&ExtractedView, &Msaa)>,
 ) {
     for (view, msaa) in &views {
-        pipeline.ensure(&cache, view.target_format, msaa.samples(), true);
-        pipeline.ensure(&cache, view.target_format, msaa.samples(), false);
+        for opaque in [true, false] {
+            pipeline.ensure(&cache, view.target_format, msaa.samples(), opaque);
+            pipeline.ensure_param(&cache, view.target_format, msaa.samples(), opaque);
+        }
+    }
+}
+
+/// Copies parametric primitives into the render world — pure instance data,
+/// no geometry work of any kind.
+fn extract_primitives(
+    primitives: Extract<Query<(&VectorPrimitive, &GlobalTransform)>>,
+    mut extracted: ResMut<ExtractedParametrics>,
+) {
+    extracted.0.clear();
+    for (primitive, transform) in &primitives {
+        let model = transform.to_matrix();
+        let VectorPrimitive::Arc { inner, outer, start, sweep, color } = *primitive;
+        extracted.0.push(ParamItem {
+            z: model.w_axis.z,
+            linear: [model.x_axis.x, model.x_axis.y, model.y_axis.x, model.y_axis.y],
+            translation: [model.w_axis.x, model.w_axis.y],
+            color: pack_color(color),
+            params: [start, sweep, inner, outer],
+            opaque: color.alpha >= 1.0,
+        });
     }
 }
 
@@ -762,6 +986,63 @@ fn prepare_vector_buffers(
     }
 }
 
+/// Parametric primitives: build the canonical mesh once, then rewrite the
+/// (tiny) instance buffer each frame — opaque section first, translucent
+/// back-to-front behind it.
+fn prepare_parametrics(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut extracted: ResMut<ExtractedParametrics>,
+    mut buffers: ResMut<VectorBuffers>,
+) {
+    if extracted.0.is_empty() {
+        buffers.param_total_count = 0;
+        buffers.param_opaque_count = 0;
+        return;
+    }
+    if buffers.param_vertex.is_none() {
+        let (vertices, indices) = canonical_arc_mesh();
+        buffers.param_vertex = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("pf_vector_param_vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: BufferUsages::VERTEX,
+        }));
+        buffers.param_index = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("pf_vector_param_indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: BufferUsages::INDEX,
+        }));
+    }
+
+    extracted.0.sort_unstable_by(|a, b| {
+        b.opaque.cmp(&a.opaque).then(a.z.total_cmp(&b.z))
+    });
+    let instances: Vec<GpuParamInstance> = extracted
+        .0
+        .iter()
+        .map(|item| GpuParamInstance {
+            linear: item.linear,
+            translation_z: [item.translation[0], item.translation[1], item.z, 0.0],
+            color: item.color,
+            params: item.params,
+        })
+        .collect();
+    buffers.param_total_count = instances.len() as u32;
+    buffers.param_opaque_count = extracted.0.iter().filter(|i| i.opaque).count() as u32;
+
+    let bytes: &[u8] = bytemuck::cast_slice(&instances);
+    if buffers.param_instance.is_none() || buffers.param_instance_capacity < bytes.len() {
+        buffers.param_instance = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("pf_vector_param_instances"),
+            contents: bytes,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        }));
+        buffers.param_instance_capacity = bytes.len();
+    } else if let Some(buffer) = &buffers.param_instance {
+        queue.write_buffer(buffer, 0, bytes);
+    }
+}
+
 fn prepare_view_bind_groups(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -807,27 +1088,36 @@ fn vector_pass(
     )>,
     mut ctx: RenderContext,
 ) {
-    if buffers.opaque_batches.is_empty() && buffers.blend_batches.is_empty() {
+    let has_tessellated = (!buffers.opaque_batches.is_empty()
+        || !buffers.blend_batches.is_empty())
+        && buffers.vertex.is_some()
+        && buffers.index.is_some()
+        && buffers.instance.is_some();
+    let has_params = buffers.param_total_count > 0
+        && buffers.param_vertex.is_some()
+        && buffers.param_index.is_some()
+        && buffers.param_instance.is_some();
+    if !has_tessellated && !has_params {
         return;
     }
     let view_entity = view.entity();
     let (camera, extracted_view, target, depth, msaa) = view.into_inner();
 
-    let get_pipeline = |opaque| {
-        pipeline
-            .get(extracted_view.target_format, msaa.samples(), opaque)
-            .and_then(|id| pipeline_cache.get_render_pipeline(id))
+    let get = |id: Option<CachedRenderPipelineId>| {
+        id.and_then(|id| pipeline_cache.get_render_pipeline(id))
     };
-    let (Some(opaque_pipeline), Some(blend_pipeline)) = (get_pipeline(true), get_pipeline(false))
-    else {
+    let (format, samples) = (extracted_view.target_format, msaa.samples());
+    let opaque_pipeline = get(pipeline.get(format, samples, true));
+    let blend_pipeline = get(pipeline.get(format, samples, false));
+    let param_opaque_pipeline = get(pipeline.get_param(format, samples, true));
+    let param_blend_pipeline = get(pipeline.get_param(format, samples, false));
+    let tess_ready = has_tessellated && opaque_pipeline.is_some() && blend_pipeline.is_some();
+    let params_ready =
+        has_params && param_opaque_pipeline.is_some() && param_blend_pipeline.is_some();
+    if !tess_ready && !params_ready {
         // Still compiling; skip the frame rather than stall.
         return;
-    };
-    let (Some(vertex), Some(index), Some(instance)) =
-        (&buffers.vertex, &buffers.index, &buffers.instance)
-    else {
-        return;
-    };
+    }
     let Some(bind_group) = bind_groups
         .per_view
         .get(&view_entity)
@@ -854,15 +1144,35 @@ fn vector_pass(
     }
 
     pass.set_bind_group(0, bind_group, &[]);
-    pass.set_vertex_buffer(0, vertex.slice(..));
-    pass.set_vertex_buffer(1, instance.slice(..));
-    pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
 
     let indirect = buffers.use_multi_draw.then(|| buffers.indirect.as_ref()).flatten();
     let args_size = size_of::<GpuDrawIndexedIndirect>() as u64;
 
-    if !buffers.opaque_batches.is_empty() {
-        pass.set_render_pipeline(opaque_pipeline);
+    macro_rules! bind_tessellated {
+        () => {{
+            pass.set_vertex_buffer(0, buffers.vertex.as_ref().unwrap().slice(..));
+            pass.set_vertex_buffer(1, buffers.instance.as_ref().unwrap().slice(..));
+            pass.set_index_buffer(
+                buffers.index.as_ref().unwrap().slice(..),
+                IndexFormat::Uint32,
+            );
+        }};
+    }
+    macro_rules! bind_params {
+        () => {{
+            pass.set_vertex_buffer(0, buffers.param_vertex.as_ref().unwrap().slice(..));
+            pass.set_vertex_buffer(1, buffers.param_instance.as_ref().unwrap().slice(..));
+            pass.set_index_buffer(
+                buffers.param_index.as_ref().unwrap().slice(..),
+                IndexFormat::Uint32,
+            );
+        }};
+    }
+
+    // Opaque phase: depth-tested, order-free across both sources.
+    if tess_ready && !buffers.opaque_batches.is_empty() {
+        bind_tessellated!();
+        pass.set_render_pipeline(opaque_pipeline.unwrap());
         match indirect {
             Some(indirect) => pass.multi_draw_indexed_indirect(
                 indirect,
@@ -880,8 +1190,19 @@ fn vector_pass(
             }
         }
     }
-    if !buffers.blend_batches.is_empty() {
-        pass.set_render_pipeline(blend_pipeline);
+    if params_ready && buffers.param_opaque_count > 0 {
+        bind_params!();
+        pass.set_render_pipeline(param_opaque_pipeline.unwrap());
+        pass.draw_indexed(0..ARC_INTERIOR_INDEX_COUNT, 0, 0..buffers.param_opaque_count);
+    }
+
+    // Blend phase. Tessellated blend items are strictly back-to-front among
+    // themselves; parametric translucent interiors and all parametric
+    // fringes draw after them (1px fringes — cross-source ordering error is
+    // visually negligible for HUD content).
+    if tess_ready && !buffers.blend_batches.is_empty() {
+        bind_tessellated!();
+        pass.set_render_pipeline(blend_pipeline.unwrap());
         match indirect {
             Some(indirect) => pass.multi_draw_indexed_indirect(
                 indirect,
@@ -898,6 +1219,18 @@ fn vector_pass(
                 }
             }
         }
+    }
+    if params_ready {
+        let total = buffers.param_total_count;
+        let translucent = buffers.param_opaque_count..total;
+        bind_params!();
+        pass.set_render_pipeline(param_blend_pipeline.unwrap());
+        if !translucent.is_empty() {
+            pass.draw_indexed(0..ARC_INTERIOR_INDEX_COUNT, 0, translucent);
+        }
+        // Fringes for every parametric instance.
+        let index_count: u32 = (64 * 6) + (64 * 12) + 12;
+        pass.draw_indexed(ARC_INTERIOR_INDEX_COUNT..index_count, 0, 0..total);
     }
 
     pass_span.end(&mut pass);

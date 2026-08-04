@@ -105,7 +105,18 @@ from any reference renderer:
   the reproducibility artifact.
 - Skia / Pathfinder: unmeasured, would need standalone harnesses.
 
-## Workload 2 status (2026-08-03)
+## Workload 2: WON (2026-08-03)
+
+VectorPrimitive::Arc (parametric instanced primitives): canonical (t, side)
+strip mesh, vertex shader computes ring-segment geometry + analytic AA
+fringes from per-instance [start, sweep, inner, outer]. Animating = one
+52-byte instance write; all arcs draw in one instanced call per phase.
+Workload 2 (200 el / 50 dynamic, p50): engine 0.73 ms frame / 0.0102 GPU
+vs control 0.99 / 0.0215 — wins both. Draw-order caveat: parametric blend
+items draw after tessellated blend items (1px fringes, negligible).
+Next primitive candidates when bevy_pf needs them: rounded-rect/bar, pie.
+
+## Workload 2 history (2026-08-03)
 
 Dynamic topology is implemented: shapes whose VectorShape mutates
 tessellate into a transient tail region of the shared buffers (unchanged

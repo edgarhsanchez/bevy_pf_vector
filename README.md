@@ -97,22 +97,18 @@ arbitrary dynamic scenes this engine deliberately does not.
 
 | backend | frame | render GPU |
 |---|---|---|
-| shapes (SDF control) | **0.99 ms** | 0.0215 ms |
+| shapes (SDF control) | 0.99 ms | 0.0215 ms |
 | vello 0.9 | 1.19 ms | 0.854 ms |
-| engine (`--dynamic 50`) | 1.52 ms | **0.0092 ms** |
+| engine, `VectorShape` mutation (re-tessellating) | 1.52 ms | 0.0092 ms |
+| **engine, `VectorPrimitive::Arc` (parametric)** | **0.73 ms** | **0.0102 ms** |
 
-Honest reading: the engine now *supports* per-frame topology change (shapes
-whose `VectorShape` mutates tessellate into a transient buffer region;
-unchanged shapes stay on the tessellate-once path; stable-size dynamic
-shapes even keep the prepare fast path) — and its GPU time stays 2.3x ahead
-of the control. But the control wins workload-2 *frame* time: parametric
-SDF arcs are bevy_vector_shapes' native primitive, costing it zero geometry
-work, while we pay ~1 ms CPU re-tessellating 50 arcs per frame. The
-recorded fix (next milestone): parametric instanced primitives — a
-canonical (t, side) strip whose vertex shader computes ring-segment
-positions from per-instance start/sweep/radii, making parameter animation
-free for the common gauge/bar/arc cases while arbitrary paths keep the
-tessellation path.
+The engine wins workload 2 on both metrics via `VectorPrimitive` — a
+canonical (t, side) strip mesh whose vertex shader computes ring-segment
+geometry (and its analytic AA fringes) from per-instance
+[start, sweep, inner, outer]. Animating a gauge is one 52-byte instance
+write: zero tessellation, all arcs in one instanced draw. Arbitrary-path
+mutation is also supported (rows above): changed `VectorShape`s tessellate
+into a transient buffer region, priced per changed shape, cache untouched.
 
 Not yet measured: Skia, Pathfinder (different stacks, standalone
 harnesses), rive native on workload 2, and workloads 3-4.

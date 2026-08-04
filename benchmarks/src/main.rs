@@ -190,7 +190,7 @@ fn arc_sweep(t: f32, speed: f32, phase: f32) -> f32 {
     0.75 * std::f32::consts::TAU * (0.5 + 0.5 * ops::sin(t * speed + phase))
 }
 
-/// Workload 2, engine/vello: rewrite the arc paths every frame.
+/// Workload 2, vello: rewrite the arc paths every frame (its model).
 fn animate_arcs(
     frame: Res<FrameCount>,
     mut query: Query<(&Animated, &DynamicArc, &mut bevy_pf_vector::VectorShape)>,
@@ -199,6 +199,19 @@ fn animate_arcs(
     for (anim, arc, mut shape) in &mut query {
         let sweep = arc_sweep(t, anim.speed, anim.phase);
         shape.commands = ring_segment_path(arc.outer, arc.inner, -0.75, -0.75 + sweep, 40);
+    }
+}
+
+/// Workload 2, engine: sweep is a parameter — one instance write, no
+/// geometry work of any kind.
+fn animate_arcs_param(
+    frame: Res<FrameCount>,
+    mut query: Query<(&Animated, &mut bevy_pf_vector::VectorPrimitive)>,
+) {
+    let t = frame.0 as f32 / 120.0;
+    for (anim, mut primitive) in &mut query {
+        let bevy_pf_vector::VectorPrimitive::Arc { sweep, .. } = &mut *primitive;
+        *sweep = arc_sweep(t, anim.speed, anim.phase);
     }
 }
 
@@ -462,20 +475,28 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
         // Same rng draws as the control; scale stays 1.0 — size is in the path.
         let (transform, anim) = animated(pos, 1.0, &mut rng);
 
-        // Workload 2: the first `dynamic` elements are gauge arcs whose
-        // sweep rewrites the path every frame. No extra rng draws, so the
-        // stream stays aligned with the other backends.
+        // Workload 2: the first `dynamic` elements are gauge arcs. The
+        // engine backend uses its parametric fast path (sweep animation is
+        // an instance write — zero tessellation); the vello backend renders
+        // the same arcs as mutating paths (its model). No extra rng draws,
+        // so the stream stays aligned with the other backends.
         if i < cfg.dynamic {
             let (outer, inner) = (size, size * 0.62);
-            commands.spawn((
-                VectorShape {
+            let mut entity = commands.spawn((transform, anim, DynamicArc { outer, inner }));
+            if cfg.backend == Backend::Engine {
+                entity.insert(bevy_pf_vector::VectorPrimitive::Arc {
+                    inner,
+                    outer,
+                    start: -0.75,
+                    sweep: 2.35,
+                    color: color,
+                });
+            } else {
+                entity.insert(VectorShape {
                     commands: ring_segment_path(outer, inner, -0.75, 1.6, 40),
                     style: fill(color),
-                },
-                transform,
-                anim,
-                DynamicArc { outer, inner },
-            ));
+                });
+            }
             continue;
         }
 
@@ -779,7 +800,7 @@ fn main() {
         Backend::Engine => app
             .add_plugins(bevy_pf_vector::PfVectorPlugin)
             .add_systems(Startup, setup_engine)
-            .add_systems(Update, animate_arcs.after(animate).before(sample)),
+            .add_systems(Update, animate_arcs_param.after(animate).before(sample)),
         // Same VectorShape entities as the engine backend, rendered by vello.
         Backend::Vello => app
             .add_plugins(vello_backend::VelloBackendPlugin)
