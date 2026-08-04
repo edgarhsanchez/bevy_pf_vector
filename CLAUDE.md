@@ -105,6 +105,30 @@ from any reference renderer:
   the reproducibility artifact.
 - Skia / Pathfinder: unmeasured, would need standalone harnesses.
 
+## Workload 3: WON (2026-08-03)
+
+Analytic clip chains: VectorClipShape (rounded-rect/circle) entities +
+ClippedBy(entity) references, nested up to 4; extract resolves chains into
+a fixed 1024-entry storage buffer of inverse transforms + SDF params; each
+instance packs (chain_start*8+count) into its spare instance-lane float;
+fragment multiplies AA'd SDF coverage per entry (straight-line unrolled, no
+loop). Clipped instances route to the blend phase (opaque REPLACE would
+ignore the alpha knock-out — that was bug #1). Results (12 panels + outer,
+240 shapes, p50): engine 0.78 ms frame / 0.0266 ms GPU; vello (native clip
+layers, chain-diff push/pop encoding in the backend) 1.11 / 0.953; control
+CANNOT run it (no clipping). ~36x GPU vs vello.
+
+Bug worth remembering: view.viewport is (origin.xy, size.zw) —
+`viewport.x` is ORIGIN (0!), width is `.z`. Using .x made px_world
+infinite: every clip SDF flattened to coverage 0.5 AND fringe AA had been
+silently degenerate since the AA milestone (fringes displaced to infinity
+= no AA). Found by screenshot-driven shader bisection (dump cov, dump raw
+buffer words, dump varyings). Post-fix honest numbers: W1 200 el
+0.0143 ms GPU (was 0.0092 pre-fix/broken-AA), 5000 el 0.200 (was 0.137),
+W2 0.0155 (was 0.0102) — all wins hold. clips_raw is read as
+array<vec4<f32>> reconstructed per entry (typed-struct storage reads also
+misbehaved during debugging; raw reads are unambiguous).
+
 ## Workload 2: WON (2026-08-03)
 
 VectorPrimitive::Arc (parametric instanced primitives): canonical (t, side)

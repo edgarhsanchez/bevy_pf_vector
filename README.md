@@ -56,7 +56,7 @@ visually via `--screenshot` for engine and vello.
 | vello 0.9 (in-process, shared device) | 0.816 ms | 1.493 ms | 0.385 ms encode (p95 1.14) |
 | shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | — |
 | engine, first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | — |
-| **engine, current** | **0.0082 ms** | **0.137 ms** | **none (tessellate-once)** |
+| **engine, current** | **0.0143 ms** | **0.200 ms** | **none (tessellate-once)** |
 
 **Native Rive Renderer (C++), measured.** Built from rive-runtime at the
 pinned SHA (clang/lld, Vulkan backend, SPIR-V via glslang) with a local
@@ -100,7 +100,7 @@ arbitrary dynamic scenes this engine deliberately does not.
 | shapes (SDF control) | 0.99 ms | 0.0215 ms |
 | vello 0.9 | 1.19 ms | 0.854 ms |
 | engine, `VectorShape` mutation (re-tessellating) | 1.52 ms | 0.0092 ms |
-| **engine, `VectorPrimitive::Arc` (parametric)** | **0.73 ms** | **0.0102 ms** |
+| **engine, `VectorPrimitive::Arc` (parametric)** | **0.78 ms** | **0.0155 ms** |
 
 The engine wins workload 2 on both metrics via `VectorPrimitive` — a
 canonical (t, side) strip mesh whose vertex shader computes ring-segment
@@ -110,8 +110,31 @@ write: zero tessellation, all arcs in one instanced draw. Arbitrary-path
 mutation is also supported (rows above): changed `VectorShape`s tessellate
 into a transient buffer region, priced per changed shape, cache untouched.
 
+## Workload 3 results (nested clips: 12 rounded-rect panels inside an outer
+## region, 240 overflowing shapes, 2-level chains — p50 over 600 frames)
+
+| backend | frame | render GPU |
+|---|---|---|
+| shapes control | not supported (no clipping) | — |
+| vello 0.9 (native clip layers) | 1.11 ms | 0.953 ms |
+| **engine (`--clips 12`)** | **0.78 ms** | **0.0266 ms** |
+
+Clipping is analytic: clip shapes (`VectorClipShape` rounded-rects/circles,
+nested via `ClippedBy`, up to 4 deep) live in a storage buffer as inverse
+transforms + SDF parameters; each instance carries a packed chain reference
+in its spare instance lane and the fragment shader multiplies coverage per
+entry. Clip edges are antialiased (stencil clipping can't do that), no
+extra draw calls or state changes, batching fully preserved. Clipped
+instances route through the blend phase for the alpha knock-out.
+
+Note on current numbers: a viewport-component bug (origin.x where width
+belonged) had been making fringe AA degenerate and was found via
+screenshot-driven shader bisection while building workload 3; with it fixed
+the engine pays its real AA cost — earlier GPU figures were ~30-45% lower
+but with broken edge AA. The tables above are the honest, corrected values.
+
 Not yet measured: Skia, Pathfinder (different stacks, standalone
-harnesses), rive native on workload 2, and workloads 3-4.
+harnesses), rive native on workloads 2-3, and workload 4 (stroke stress).
 
 The engine wins by structure, not tuning:
 

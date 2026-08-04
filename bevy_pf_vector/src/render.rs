@@ -49,7 +49,7 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
 use bevy::shader::Shader;
 
 use crate::tess;
-use crate::{VectorPrimitive, VectorShape};
+use crate::{ClippedBy, VectorClipShape, VectorPrimitive, VectorShape};
 
 pub const VECTOR_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("7a3f1c2e-9b4d-4b8a-a2f0-5e1d3c6b9f01");
@@ -75,16 +75,21 @@ impl Plugin for VectorRenderPlugin {
             .init_resource::<GeometryCache>()
             .init_resource::<ExtractedShapes>()
             .init_resource::<ExtractedParametrics>()
+            .init_resource::<ExtractedClips>()
             .init_resource::<VectorBuffers>()
             .init_resource::<VectorViewBindGroups>()
             .init_resource::<VectorPipeline>()
-            .add_systems(ExtractSchedule, (extract_shapes, extract_primitives))
+            .add_systems(
+                ExtractSchedule,
+                (extract_clips, extract_shapes, extract_primitives).chain(),
+            )
             .add_systems(
                 Render,
                 (
                     queue_vector_pipelines.in_set(RenderSystems::Queue),
                     prepare_vector_buffers.in_set(RenderSystems::PrepareResources),
                     prepare_parametrics.in_set(RenderSystems::PrepareResources),
+                    prepare_clips.in_set(RenderSystems::PrepareResources),
                     prepare_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
@@ -111,6 +116,35 @@ struct GpuInstance {
     linear: [f32; 4],
     translation_z: [f32; 4],
     color: [u8; 4],
+}
+
+/// One analytic clip entry: inverse world transform of the clip entity plus
+/// SDF parameters. A circle is a rounded rect with zero half-extents.
+/// 48 bytes, 16-aligned for storage-buffer array stride.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuClip {
+    inv_linear: [f32; 4],
+    inv_translation: [f32; 2],
+    half_extents: [f32; 2],
+    radius: f32,
+    _pad: [f32; 3],
+}
+
+/// Fixed clip-buffer capacity: created once so view bind groups stay stable.
+const MAX_CLIPS: usize = 1024;
+
+/// Packs a clip chain reference into one f32 (rides in the instance's spare
+/// lane): index * 8 + count, exact in f32 for index < 2^20.
+fn pack_clip(start: u32, count: u32) -> f32 {
+    (start * 8 + count.min(7)) as f32
+}
+
+/// Per-frame clip entries and resolved chains, keyed by chain head entity.
+#[derive(Resource, Default)]
+pub struct ExtractedClips {
+    entries: Vec<GpuClip>,
+    chains: HashMap<Entity, (u32, u32)>,
 }
 
 /// 52 bytes: the tessellated-instance fields plus the primitive parameters
@@ -326,6 +360,7 @@ struct ExtractedInstance {
     translation: [f32; 2],
     color: [u8; 4],
     opaque: bool,
+    clip: f32,
 }
 
 #[derive(Resource, Default)]
@@ -372,6 +407,7 @@ struct ParamItem {
     color: [u8; 4],
     params: [f32; 4],
     opaque: bool,
+    clip: f32,
 }
 
 #[derive(Resource, Default)]
@@ -413,6 +449,9 @@ pub struct VectorBuffers {
     param_instance_capacity: usize,
     param_opaque_count: u32,
     param_total_count: u32,
+    /// Fixed-capacity analytic clip storage (created once; bind groups stay
+    /// stable), rewritten per frame.
+    clip: Option<Buffer>,
 }
 
 #[derive(Default)]
@@ -444,9 +483,12 @@ impl Default for VectorPipeline {
         Self {
             view_layout: BindGroupLayoutDescriptor::new(
                 "pf_vector_view_layout",
-                &BindGroupLayoutEntries::single(
-                    ShaderStages::VERTEX,
-                    uniform_buffer::<VectorViewUniform>(false),
+                &BindGroupLayoutEntries::with_indices(
+                    ShaderStages::VERTEX_FRAGMENT,
+                    (
+                        (0, uniform_buffer::<VectorViewUniform>(false)),
+                        (1, bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(false, None)),
+                    ),
                 ),
             ),
             variants: HashMap::new(),
@@ -603,7 +645,8 @@ fn pack_color(color: LinearRgba) -> [u8; 4] {
 /// transient region instead — dynamic topology works, priced per changed
 /// shape, without poisoning the cache.
 fn extract_shapes(
-    shapes: Extract<Query<(Ref<VectorShape>, &GlobalTransform)>>,
+    shapes: Extract<Query<(Ref<VectorShape>, &GlobalTransform, Option<&ClippedBy>)>>,
+    clips: Res<ExtractedClips>,
     mut cache: ResMut<GeometryCache>,
     mut extracted: ResMut<ExtractedShapes>,
 ) {
@@ -617,7 +660,11 @@ fn extract_shapes(
         *cache = GeometryCache::default();
     }
 
-    for (shape, transform) in &shapes {
+    for (shape, transform, clipped) in &shapes {
+        let clip = clipped
+            .and_then(|c| clips.chains.get(&c.0))
+            .map(|&(start, count)| pack_clip(start, count))
+            .unwrap_or(0.0);
         let model = transform.to_matrix();
         let linear = [
             model.x_axis.x,
@@ -646,7 +693,10 @@ fn extract_shapes(
                     linear,
                     translation,
                     color: pack_color(color),
-                    opaque: color.alpha >= 1.0,
+                    // Clipped instances need blending (both for the alpha
+                    // knock-out and for AA clip edges).
+                    opaque: color.alpha >= 1.0 && clip == 0.0,
+                    clip,
                 });
             }
         }
@@ -667,7 +717,8 @@ fn extract_shapes(
                     linear,
                     translation,
                     color: pack_color(stroke.color),
-                    opaque: stroke.color.alpha >= 1.0,
+                    opaque: stroke.color.alpha >= 1.0 && clip == 0.0,
+                    clip,
                 });
             }
         }
@@ -687,14 +738,87 @@ fn queue_vector_pipelines(
     }
 }
 
+/// Resolves clip entities into per-frame SDF entries and chains. Runs before
+/// shape/primitive extraction so instances can reference chains by index.
+fn extract_clips(
+    clips: Extract<Query<(Entity, &VectorClipShape, &GlobalTransform, Option<&ClippedBy>)>>,
+    mut extracted: ResMut<ExtractedClips>,
+) {
+    extracted.entries.clear();
+    extracted.chains.clear();
+
+    struct ClipNode {
+        entry: GpuClip,
+        parent: Option<Entity>,
+    }
+    let mut nodes: HashMap<Entity, ClipNode> = HashMap::default();
+    for (entity, shape, transform, parent) in &clips {
+        let model = transform.to_matrix();
+        let linear = Mat2::from_cols_array(&[
+            model.x_axis.x,
+            model.x_axis.y,
+            model.y_axis.x,
+            model.y_axis.y,
+        ]);
+        let inverse = linear.inverse();
+        let translation = Vec2::new(model.w_axis.x, model.w_axis.y);
+        let inv_translation = -(inverse * translation);
+        let (half_extents, radius) = match *shape {
+            VectorClipShape::RoundedRect { half_extents, radius } => {
+                ([half_extents.x - radius, half_extents.y - radius], radius)
+            }
+            VectorClipShape::Circle { radius } => ([0.0, 0.0], radius),
+        };
+        nodes.insert(
+            entity,
+            ClipNode {
+                entry: GpuClip {
+                    inv_linear: inverse.to_cols_array(),
+                    inv_translation: inv_translation.to_array(),
+                    half_extents,
+                    radius,
+                    _pad: [0.0; 3],
+                },
+                parent: parent.map(|p| p.0),
+            },
+        );
+    }
+
+    // Materialize each head's chain (walking ancestors, capped at 4) once.
+    let heads: Vec<Entity> = nodes.keys().copied().collect();
+    for head in heads {
+        let start = extracted.entries.len() as u32;
+        if start as usize >= MAX_CLIPS {
+            break;
+        }
+        let mut count = 0u32;
+        let mut cursor = Some(head);
+        while let (Some(entity), true) = (cursor, count < 4) {
+            let Some(node) = nodes.get(&entity) else { break };
+            if extracted.entries.len() >= MAX_CLIPS {
+                break;
+            }
+            extracted.entries.push(node.entry);
+            count += 1;
+            cursor = node.parent;
+        }
+        extracted.chains.insert(head, (start, count));
+    }
+}
+
 /// Copies parametric primitives into the render world — pure instance data,
 /// no geometry work of any kind.
 fn extract_primitives(
-    primitives: Extract<Query<(&VectorPrimitive, &GlobalTransform)>>,
+    primitives: Extract<Query<(&VectorPrimitive, &GlobalTransform, Option<&ClippedBy>)>>,
+    clips: Res<ExtractedClips>,
     mut extracted: ResMut<ExtractedParametrics>,
 ) {
     extracted.0.clear();
-    for (primitive, transform) in &primitives {
+    for (primitive, transform, clipped) in &primitives {
+        let clip = clipped
+            .and_then(|c| clips.chains.get(&c.0))
+            .map(|&(start, count)| pack_clip(start, count))
+            .unwrap_or(0.0);
         let model = transform.to_matrix();
         let VectorPrimitive::Arc { inner, outer, start, sweep, color } = *primitive;
         extracted.0.push(ParamItem {
@@ -703,7 +827,8 @@ fn extract_primitives(
             translation: [model.w_axis.x, model.w_axis.y],
             color: pack_color(color),
             params: [start, sweep, inner, outer],
-            opaque: color.alpha >= 1.0,
+            opaque: color.alpha >= 1.0 && clip == 0.0,
+            clip,
         });
     }
 }
@@ -820,13 +945,14 @@ fn prepare_vector_buffers(
             group_key(&item.geometry).hash(&mut hasher);
             item.z.to_bits().hash(&mut hasher);
             item.opaque.hash(&mut hasher);
+            item.clip.to_bits().hash(&mut hasher);
         }
         hasher.finish()
     };
 
     let gpu_instance = |item: &ExtractedInstance| GpuInstance {
         linear: item.linear,
-        translation_z: [item.translation[0], item.translation[1], item.z, 0.0],
+        translation_z: [item.translation[0], item.translation[1], item.z, item.clip],
         color: item.color,
     };
 
@@ -1022,7 +1148,7 @@ fn prepare_parametrics(
         .iter()
         .map(|item| GpuParamInstance {
             linear: item.linear,
-            translation_z: [item.translation[0], item.translation[1], item.z, 0.0],
+            translation_z: [item.translation[0], item.translation[1], item.z, item.clip],
             color: item.color,
             params: item.params,
         })
@@ -1043,13 +1169,51 @@ fn prepare_parametrics(
     }
 }
 
+/// Uploads this frame's analytic clip entries into the fixed-capacity
+/// storage buffer (created once so view bind groups never churn).
+fn prepare_clips(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    extracted: Res<ExtractedClips>,
+    mut buffers: ResMut<VectorBuffers>,
+) {
+    let buffer = buffers.clip.get_or_insert_with(|| {
+        device.create_buffer(&BufferDescriptor {
+            label: Some("pf_vector_clips"),
+            size: (MAX_CLIPS * size_of::<GpuClip>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    });
+    if !extracted.entries.is_empty() {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&extracted.entries));
+    }
+    if std::env::var("PF_DEBUG_CLIPS").is_ok() {
+        eprintln!(
+            "clips: {} entries, {} chains",
+            extracted.entries.len(),
+            extracted.chains.len()
+        );
+        if let Some(e) = extracted.entries.first() {
+            eprintln!(
+                "first entry: inv={:?} t={:?} half={:?} r={}",
+                e.inv_linear, e.inv_translation, e.half_extents, e.radius
+            );
+        }
+    }
+}
+
 fn prepare_view_bind_groups(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline: Res<VectorPipeline>,
+    buffers: Res<VectorBuffers>,
     views: Query<(Entity, &ExtractedView)>,
     mut bind_groups: ResMut<VectorViewBindGroups>,
 ) {
+    let Some(clip_buffer) = &buffers.clip else {
+        return;
+    };
     for (entity, view) in &views {
         let clip_from_world = view.clip_from_world.unwrap_or_else(|| {
             view.clip_from_view * view.world_from_view.to_matrix().inverse()
@@ -1064,7 +1228,10 @@ fn prepare_view_bind_groups(
             entry.bind_group = Some(device.create_bind_group(
                 "pf_vector_view_bind_group",
                 &layout,
-                &BindGroupEntries::single(entry.uniform.binding().unwrap()),
+                &BindGroupEntries::with_indices((
+                    (0, entry.uniform.binding().unwrap()),
+                    (1, clip_buffer.as_entire_binding()),
+                )),
             ));
         }
     }

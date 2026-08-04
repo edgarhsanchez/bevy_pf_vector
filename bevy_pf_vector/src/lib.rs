@@ -44,6 +44,23 @@ pub enum VectorPrimitive {
     },
 }
 
+/// A clip region. Entities with this component don't render; content
+/// references them via [`ClippedBy`]. Clips nest by putting `ClippedBy` on a
+/// clip entity itself (up to 4 levels). Evaluated analytically in the
+/// fragment shader — clip edges are antialiased and clipping costs no extra
+/// draw calls, state changes, or stencil passes.
+#[derive(Component, Clone, Copy, Debug)]
+#[require(Transform)]
+pub enum VectorClipShape {
+    RoundedRect { half_extents: Vec2, radius: f32 },
+    Circle { radius: f32 },
+}
+
+/// Clips the entity's rendering to the referenced [`VectorClipShape`] entity
+/// (and that clip's own ancestors, if it is itself clipped).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct ClippedBy(pub Entity);
+
 pub struct PfVectorPlugin;
 
 impl Plugin for PfVectorPlugin {

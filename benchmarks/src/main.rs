@@ -57,6 +57,8 @@ struct BenchConfig {
     /// Workload 2: the first N elements are gauge arcs whose sweep angle
     /// rewrites their path every frame (topology churn).
     dynamic: u32,
+    /// Workload 3: number of clip panels (nested inside one outer clip).
+    clips: u32,
     warmup: u32,
     frames: u32,
     out_dir: PathBuf,
@@ -68,6 +70,7 @@ fn parse_args() -> BenchConfig {
     let mut backend = Backend::Shapes;
     let mut elements = 200u32;
     let mut dynamic = 0u32;
+    let mut clips = 0u32;
     let mut warmup = 120u32;
     let mut frames = 600u32;
     let mut out_dir = PathBuf::from("benchmarks/results");
@@ -92,6 +95,7 @@ fn parse_args() -> BenchConfig {
             }
             "--elements" => elements = value().parse().expect("--elements"),
             "--dynamic" => dynamic = value().parse().expect("--dynamic"),
+            "--clips" => clips = value().parse().expect("--clips"),
             "--warmup" => warmup = value().parse().expect("--warmup"),
             "--frames" => frames = value().parse().expect("--frames"),
             "--out" => out_dir = PathBuf::from(value()),
@@ -102,13 +106,15 @@ fn parse_args() -> BenchConfig {
     }
 
     let label = label.unwrap_or_else(|| {
-        if dynamic > 0 {
+        if clips > 0 {
+            format!("{}_{}el_{}clips_{}f", backend.name(), elements, clips, frames)
+        } else if dynamic > 0 {
             format!("{}_{}el_{}dyn_{}f", backend.name(), elements, dynamic, frames)
         } else {
             format!("{}_{}el_{}f", backend.name(), elements, frames)
         }
     });
-    BenchConfig { backend, elements, dynamic, warmup, frames, out_dir, label, screenshot }
+    BenchConfig { backend, elements, dynamic, clips, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -358,6 +364,83 @@ fn setup_shapes(mut commands: Commands, cfg: Res<BenchConfig>) {
     }
 }
 
+/// Workload 3: nested clips. One outer rounded-rect "safe area", `clips`
+/// rounded-rect panels inside it, and `elements` shapes distributed across
+/// the panels — every shape clipped by its panel, every panel clipped by the
+/// outer region (2-level chains). Content deliberately overflows panel
+/// bounds so clipping visibly cuts. Engine and vello share this ECS content;
+/// vello encodes it as nested clip layers (its native model).
+fn setup_clip_workload(mut commands: Commands, cfg: Res<BenchConfig>) {
+    use bevy_pf_vector::{ClippedBy, VectorClipShape, VectorShape};
+    use paths::*;
+    if cfg.clips == 0 {
+        return;
+    }
+
+    let outer = commands
+        .spawn((
+            VectorClipShape::RoundedRect {
+                half_extents: Vec2::new(600.0, 320.0),
+                radius: 48.0,
+            },
+            Transform::IDENTITY,
+        ))
+        .id();
+
+    let mut rng = Rng(0xC11B5);
+    let p = cfg.clips;
+    let cols = ((p as f32 * 16.0 / 9.0).sqrt().ceil() as u32).max(1);
+    let rows = p.div_ceil(cols);
+    let (cell_w, cell_h) = (1180.0 / cols as f32, 620.0 / rows as f32);
+    let mut panels = Vec::new();
+    for i in 0..p {
+        let x = -590.0 + cell_w * ((i % cols) as f32 + 0.5);
+        let y = -310.0 + cell_h * ((i / cols) as f32 + 0.5);
+        let half = Vec2::new(cell_w * 0.42, cell_h * 0.40);
+        let panel = commands
+            .spawn((
+                VectorClipShape::RoundedRect { half_extents: half, radius: 14.0 },
+                Transform::from_xyz(x, y, 0.0),
+                ClippedBy(outer),
+            ))
+            .id();
+        // Visible panel background, clipped by the outer region only.
+        commands.spawn((
+            VectorShape {
+                commands: rounded_rect_path(half.x * 2.0, half.y * 2.0, 14.0),
+                style: fill(LinearRgba::new(1.0, 1.0, 1.0, 0.08)),
+            },
+            Transform::from_xyz(x, y, -0.5 + i as f32 * 0.001),
+            ClippedBy(outer),
+        ));
+        panels.push((panel, x, y, half));
+    }
+
+    for j in 0..cfg.elements {
+        let (panel, px, py, half) = panels[(j % p) as usize];
+        // Overflowing positions — the clip must do real work.
+        let pos = Vec3::new(
+            px + rng.range(-1.3, 1.3) * half.x,
+            py + rng.range(-1.3, 1.3) * half.y,
+            j as f32 * 0.001,
+        );
+        let size = rng.range(8.0, 22.0);
+        let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize].to_linear();
+        let (transform, anim) = animated(pos, 1.0, &mut rng);
+        let path = match rng.pick(3) {
+            0 => circle_path(size),
+            1 => rounded_rect_path(2.6 * size, 1.8 * size, size * 0.3),
+            _ => ngon_path(3 + rng.pick(6), size),
+        };
+        commands.spawn((
+            VectorShape { commands: path, style: fill(color) },
+            transform,
+            anim,
+            ClippedBy(panel),
+        ));
+    }
+}
+
 fn setup_sprites(mut commands: Commands, cfg: Res<BenchConfig>) {
     commands.spawn(Camera2d);
     let mut rng = Rng(0xB3_59_1D);
@@ -382,25 +465,22 @@ fn setup_sprites(mut commands: Commands, cfg: Res<BenchConfig>) {
 /// exactly the same order as `setup_shapes`, so layout, sizes, colors, and
 /// kinds are identical to the control — sizes are baked into path
 /// coordinates instead of transform scale so tessellation density is right.
-fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
-    use bevy_pf_vector::{LineCap, LineJoin, PathCommand, PathStyle, StrokeStyle, VectorShape};
+fn fill(color: LinearRgba) -> bevy_pf_vector::PathStyle {
+    bevy_pf_vector::PathStyle { fill: Some(color), stroke: None }
+}
+fn stroke(color: LinearRgba, width: f32) -> bevy_pf_vector::PathStyle {
+    use bevy_pf_vector::{LineCap, LineJoin, StrokeStyle};
+    bevy_pf_vector::PathStyle {
+        fill: None,
+        stroke: Some(StrokeStyle { color, width, join: LineJoin::Round, cap: LineCap::Round }),
+    }
+}
+mod paths {
+    use super::*;
+    use bevy_pf_vector::PathCommand;
 
-    fn fill(color: LinearRgba) -> PathStyle {
-        PathStyle { fill: Some(color), stroke: None }
-    }
-    fn stroke(color: LinearRgba, width: f32) -> PathStyle {
-        PathStyle {
-            fill: None,
-            stroke: Some(StrokeStyle {
-                color,
-                width,
-                join: LineJoin::Round,
-                cap: LineCap::Round,
-            }),
-        }
-    }
     /// Circle as four cubic Béziers (k = 0.5522847).
-    fn circle_path(r: f32) -> Vec<PathCommand> {
+    pub fn circle_path(r: f32) -> Vec<PathCommand> {
         let k = 0.552_284_75 * r;
         vec![
             PathCommand::MoveTo(Vec2::new(r, 0.0)),
@@ -427,7 +507,7 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
             PathCommand::Close,
         ]
     }
-    fn rounded_rect_path(w: f32, h: f32, r: f32) -> Vec<PathCommand> {
+    pub fn rounded_rect_path(w: f32, h: f32, r: f32) -> Vec<PathCommand> {
         let (hw, hh) = (w / 2.0, h / 2.0);
         let r = r.min(hw).min(hh);
         if r <= 0.0 {
@@ -452,7 +532,7 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
             PathCommand::Close,
         ]
     }
-    fn ngon_path(sides: u32, r: f32) -> Vec<PathCommand> {
+    pub fn ngon_path(sides: u32, r: f32) -> Vec<PathCommand> {
         let mut commands = Vec::new();
         for i in 0..sides {
             let a = i as f32 / sides as f32 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
@@ -462,11 +542,20 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
         commands.push(PathCommand::Close);
         commands
     }
+}
+
+fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
+    use bevy_pf_vector::{PathCommand, VectorShape};
+    use paths::*;
 
     // Analytic fringe AA makes MSAA redundant for the engine — single-sample
     // rendering is part of its shipped configuration, as MSAA 4x is part of
     // the control's.
     commands.spawn((Camera2d, bevy::render::view::Msaa::Off));
+    if cfg.clips > 0 {
+        // Workload 3 replaces the standard content; see setup_clip_workload.
+        return;
+    }
     let mut rng = Rng(0xB3_59_1D);
 
     for i in 0..cfg.elements {
@@ -748,6 +837,12 @@ fn finish(cfg: &BenchConfig, state: &BenchState, adapter: &str) {
 
 fn main() {
     let cfg = parse_args();
+    if cfg.clips > 0 && !matches!(cfg.backend, Backend::Engine | Backend::Vello) {
+        panic!(
+            "workload 3 (--clips) requires --backend engine|vello: '{}' has no clipping support",
+            cfg.backend.name()
+        );
+    }
     println!(
         "harness: backend={} elements={} warmup={} frames={}",
         cfg.backend.name(),
@@ -799,12 +894,12 @@ fn main() {
         Backend::Sprites => app.add_systems(Startup, setup_sprites),
         Backend::Engine => app
             .add_plugins(bevy_pf_vector::PfVectorPlugin)
-            .add_systems(Startup, setup_engine)
+            .add_systems(Startup, (setup_engine, setup_clip_workload))
             .add_systems(Update, animate_arcs_param.after(animate).before(sample)),
         // Same VectorShape entities as the engine backend, rendered by vello.
         Backend::Vello => app
             .add_plugins(vello_backend::VelloBackendPlugin)
-            .add_systems(Startup, setup_engine)
+            .add_systems(Startup, (setup_engine, setup_clip_workload))
             .add_systems(Update, animate_arcs.after(animate).before(sample)),
     };
 
