@@ -445,6 +445,31 @@ extract cost, and parallelising `extract_shapes` is what attacks it.
 Lesson worth keeping: this bug was only reachable by testing far beyond
 the intended workload. The suite tiers to 1M for exactly this reason.
 
+## friginrain2 UI migration — state (2026-08-04)
+
+Goal: one UI stack (bevy_pf/XAML), everything else deleted.
+
+DONE:
+- Immediate-mode settings dialog deleted (it was unreachable dead code).
+- Frizbi tuner ported to XAML (`frizbi_tuner.xaml` + TunerVm).
+- `hud_component_lab` cut from 36 components to 3: only button, card and
+  progress are referenced from the game. higher_order, scroll_area and 30
+  examples deleted with them — 11,921 lines.
+- `tool_workspace` no longer references bevy_vector_shapes: its node graph
+  paints through the engine's VectorPainter, and bezier wires are now one
+  cached cubic path each instead of a 24-segment polyline per frame.
+
+REMAINING, and bigger than it looked:
+- `friginrain_hud` (SEPARATE crate, C:/github/friginrain_hud) draws the
+  in-world HUD — minimap, skill tree, hud_edit — with 31 `ShapePainter`
+  calls across 6 files. `bevy_vector_shapes` cannot leave friginrain2
+  until that crate moves too; runtime.rs and game_view/mod.rs only still
+  register `Shape2dPlugin` on its behalf.
+- `tool_workspace` still builds its cards/buttons/progress from
+  hud_component_lab. Converting those to XAML is what lets the lab be
+  deleted outright; `theme` and `interaction` then need rehoming (tokens
+  already exist as `assets/ui/obsidian/tokens.xaml`).
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
