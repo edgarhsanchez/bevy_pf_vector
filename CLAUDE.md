@@ -270,6 +270,51 @@ throw away the instancing the whole engine is built on):
   empty). The engine stays pure: the dependency points bevy_pf -> engine,
   never the reverse.
 
+## bevy_pf GPU backend — SHIPPED + measured (2026-08-04)
+
+Implemented per the design above and working end to end: bevy_pf feature
+`vector_gpu`, module `crates/bevy_pf/src/shapes_gpu.rs`, enabled by
+friginrain2. Correctness verified by `examples/shapes_gpu_check.rs`
+(rect, rounded+stroke, ellipse, gradient, line, dashed, polyline,
+cubic+arc path — all through the GPU path only, screenshot-checked).
+Slots are reserved on a 16px grain and mutated in place on resize;
+overflow rebuilds the atlas; anything unslotted falls back to CPU.
+
+Two real bugs it exposed, both fixed and both worth remembering:
+1. ENGINE: `extract_shapes` treated "component changed" as "topology
+   changed". Bevy change detection is per-component, so a colour edit
+   re-tessellated the path EVERY FRAME. Now content-hash + cache lookup
+   regardless of the flag (engine commit aa2e043). This alone was
+   1.675 -> 1.005 ms p50 on 200 animated shapes.
+2. bevy_pf: the atlas camera re-rendered + cleared 2048² every frame.
+   Now gated on a dirty counter; static UI costs nothing.
+
+HONEST RESULT — the GPU backend does NOT currently beat CPU tiny-skia on
+UI workloads (frame-time p50, RTX A6000, 1280x720):
+
+| workload (200 shapes unless noted)   | CPU    | GPU    |
+|--------------------------------------|--------|--------|
+| 56x40 static                         | 0.847  | 0.857  |
+| 56x40 animated fill                  | 0.858  | 0.983  |
+| 24 x 300x220 animated                | 0.794  | 0.959  |
+| 24 x 300x220 animated, 256-pt path   | 0.789  | 0.849  |
+| 120x96 animated, 256-pt path         | 0.856  | 0.889  |
+
+Read the trend, not the rows: the gap closes as geometry gets complex
+(0.165 -> 0.033 ms) because tessellate-once amortises while tiny-skia
+re-flattens. But it never crosses in the range a UI plausibly occupies.
+tiny-skia is simply fast at solid fills, and the atlas round-trip (extra
+view + pass + per-frame sync) costs more than it saves. The earlier claim
+in this file that bound shapes would be "100x" was WRONG and is retracted
+— it assumed re-rasterization dominated; measurement says it does not.
+
+To make it win, remove fixed overhead, not rasterization: the atlas clear
+is the whole 2048² for a few small slots (clear only live slots, or size
+the atlas to content), and `shape_to_vector` rebuilds the whole command
+Vec per changed shape per frame (split path from paint so a colour edit
+touches neither). Until then `vector_gpu` is opt-in and honest: it buys
+GPU headroom and the engine's analytic clipping/gradients, not frame time.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
