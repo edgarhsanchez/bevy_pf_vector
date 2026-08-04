@@ -227,6 +227,49 @@ measurement, worth knowing before porting more game surfaces:
    MAKES THAT HIDDEN ART DIRECTION APPEAR — intended by the code, but a
    visible change to the game.
 
+## bevy_pf GPU backend — analysis + design (2026-08-04)
+
+friginrain2's UI is now essentially all bevy_pf/XAML (its immediate-mode
+dialog was deleted and the frizbi tuner ported; only tool_workspace is
+left). So the engine reaches that game ONLY through bevy_pf's shape
+backend. Current path, `bevy_pf/crates/bevy_pf/src/shapes.rs`:
+
+`rasterize_shapes` (plugin.rs:140) walks entities with `PfShape` +
+`ComputedNode`; when the laid-out pixel size changed OR the `PfShape`
+changed, it tiny-skia rasterizes at that size, **allocates a brand-new
+`Image` asset**, and inserts an `ImageNode`; bevy_ui composites it.
+
+What that means for where a GPU backend actually pays — measure before
+building:
+- STATIC shapes already cost nothing per frame (cached; bevy_ui just
+  composites the texture). Porting them to the engine wins little.
+- The pathological case is a DATA-BOUND shape: a `Fill`/`Stroke` bound
+  to a VM re-rasterizes on the CPU **and allocates a new Image asset and
+  re-uploads the whole texture on every change**. Colour is per-instance
+  in our engine, so this is where the engine is 100x, not 2x.
+- So: target dynamic/bound shapes first; a cheap independent win is to
+  reuse the existing texture instead of allocating a new asset per
+  repaint (and skip re-tessellation entirely for colour-only changes).
+
+Design for the real integration (NOT per-shape render-to-texture — a
+render pass per shape would be worse than what is there now, and would
+throw away the instancing the whole engine is built on):
+- One shared atlas texture. All `PfShape`s draw into it in a SINGLE
+  instanced engine pass, positioned from `ComputedNode` layout.
+- Each shape keeps an `ImageNode`, but via
+  `ImageNode::from_atlas_image(atlas, TextureAtlas { rect })` — verified
+  present in bevy_ui 0.19 (widget/image.rs:99) — so bevy_ui keeps
+  owning compositing, clipping, `Overflow::Clip`, and z-order. That is
+  the part not worth reimplementing.
+- Geometry maps cleanly: `ShapeGeometry::{Rectangle,Ellipse,Line,
+  Polyline,Path}` -> `PathCommand`, `PfBrush` -> `Brush` (gradients
+  already supported), dash array/caps/joins/fill rule all already exist
+  in `StrokeStyle`/`FillRule`.
+- bevy_pf gains a `bevy_pf_vector` dependency (it has no renderer seam
+  or feature flags today — `crates/bevy_pf/Cargo.toml` [features] is
+  empty). The engine stays pure: the dependency points bevy_pf -> engine,
+  never the reverse.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
