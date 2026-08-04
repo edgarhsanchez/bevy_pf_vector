@@ -990,14 +990,25 @@ fn prepare_vector_buffers(
         index
     };
 
-    // Section 1: opaque interiors, geometry-grouped, front-to-back in group.
+    // Section 1: opaque interiors, geometry-grouped for instancing, with
+    // groups ordered front-to-back by their nearest member (and items
+    // front-to-back within each group) so early-z rejects the most hidden
+    // fragments under heavy overlap.
     let mut opaque_order: Vec<usize> = (0..extracted.items.len())
         .filter(|&i| extracted.items[i].opaque)
         .collect();
+    let mut group_front: HashMap<(u8, u64), f32> = HashMap::default();
+    for &i in &opaque_order {
+        let item = &extracted.items[i];
+        let entry = group_front.entry(group_key(&item.geometry)).or_insert(item.z);
+        *entry = entry.max(item.z);
+    }
     opaque_order.sort_unstable_by(|&a, &b| {
         let (ia, ib) = (&extracted.items[a], &extracted.items[b]);
-        group_key(&ia.geometry)
-            .cmp(&group_key(&ib.geometry))
+        let (ka, kb) = (group_key(&ia.geometry), group_key(&ib.geometry));
+        group_front[&kb]
+            .total_cmp(&group_front[&ka])
+            .then(ka.cmp(&kb))
             .then(ib.z.total_cmp(&ia.z))
     });
     let mut last_geometry: Option<(u8, u64)> = None;

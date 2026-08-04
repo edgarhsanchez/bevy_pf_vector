@@ -59,6 +59,8 @@ struct BenchConfig {
     dynamic: u32,
     /// Workload 3: number of clip panels (nested inside one outer clip).
     clips: u32,
+    /// Overlap stress: cluster all elements in a small central disc.
+    overlap: bool,
     warmup: u32,
     frames: u32,
     out_dir: PathBuf,
@@ -76,6 +78,7 @@ fn parse_args() -> BenchConfig {
     let mut out_dir = PathBuf::from("benchmarks/results");
     let mut label = None;
     let mut screenshot = false;
+    let mut overlap = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -101,12 +104,15 @@ fn parse_args() -> BenchConfig {
             "--out" => out_dir = PathBuf::from(value()),
             "--label" => label = Some(value()),
             "--screenshot" => screenshot = true,
+            "--overlap" => overlap = true,
             other => panic!("unknown argument '{other}'"),
         }
     }
 
     let label = label.unwrap_or_else(|| {
-        if clips > 0 {
+        if overlap {
+            format!("{}_{}el_ovl_{}f", backend.name(), elements, frames)
+        } else if clips > 0 {
             format!("{}_{}el_{}clips_{}f", backend.name(), elements, clips, frames)
         } else if dynamic > 0 {
             format!("{}_{}el_{}dyn_{}f", backend.name(), elements, dynamic, frames)
@@ -114,7 +120,7 @@ fn parse_args() -> BenchConfig {
             format!("{}_{}el_{}f", backend.name(), elements, frames)
         }
     });
-    BenchConfig { backend, elements, dynamic, clips, warmup, frames, out_dir, label, screenshot }
+    BenchConfig { backend, elements, dynamic, clips, overlap, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -244,8 +250,19 @@ const HUD_PALETTE: [Color; 6] = [
     Color::srgb(0.92, 0.92, 0.92),
 ];
 
-/// Deterministic HUD-ish layout: jittered grid filling ~1280x720 world units.
-fn layout(i: u32, total: u32, rng: &mut Rng) -> (Vec3, f32) {
+/// Deterministic HUD-ish layout: jittered grid filling ~1280x720 world
+/// units — or, in overlap-stress mode, a dense central disc (art-like deep
+/// stacking).
+fn layout(i: u32, total: u32, rng: &mut Rng, overlap: bool) -> (Vec3, f32) {
+    if overlap {
+        let radius = 260.0 * rng.f32().sqrt();
+        let angle = rng.range(0.0, std::f32::consts::TAU);
+        let size = rng.range(9.0, 26.0);
+        return (
+            Vec3::new(radius * ops::cos(angle), radius * ops::sin(angle), i as f32 * 0.001),
+            size,
+        );
+    }
     let cols = ((total as f32 * 16.0 / 9.0).sqrt().ceil() as u32).max(1);
     let rows = total.div_ceil(cols);
     let cell_w = 1180.0 / cols as f32;
@@ -279,7 +296,7 @@ fn setup_shapes(mut commands: Commands, cfg: Res<BenchConfig>) {
     let mut rng = Rng(0xB3_59_1D);
 
     for i in 0..cfg.elements {
-        let (pos, size) = layout(i, cfg.elements, &mut rng);
+        let (pos, size) = layout(i, cfg.elements, &mut rng, cfg.overlap);
         let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize];
 
         let mut config = ShapeConfig::default_2d();
@@ -446,7 +463,7 @@ fn setup_sprites(mut commands: Commands, cfg: Res<BenchConfig>) {
     let mut rng = Rng(0xB3_59_1D);
 
     for i in 0..cfg.elements {
-        let (pos, size) = layout(i, cfg.elements, &mut rng);
+        let (pos, size) = layout(i, cfg.elements, &mut rng, cfg.overlap);
         let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize];
         let (transform, anim) = animated(pos, size, &mut rng);
         commands.spawn((
@@ -559,7 +576,7 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
     let mut rng = Rng(0xB3_59_1D);
 
     for i in 0..cfg.elements {
-        let (pos, size) = layout(i, cfg.elements, &mut rng);
+        let (pos, size) = layout(i, cfg.elements, &mut rng, cfg.overlap);
         let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize].to_linear();
         // Same rng draws as the control; scale stays 1.0 — size is in the path.
         let (transform, anim) = animated(pos, 1.0, &mut rng);

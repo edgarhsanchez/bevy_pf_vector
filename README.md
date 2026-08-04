@@ -133,8 +133,26 @@ screenshot-driven shader bisection while building workload 3; with it fixed
 the engine pays its real AA cost — earlier GPU figures were ~30-45% lower
 but with broken edge AA. The tables above are the honest, corrected values.
 
+## Overlap stress (2000 shapes stacked ~15 deep in a central disc — p50)
+
+| backend | render GPU | fragment invocations |
+|---|---|---|
+| shapes control | 0.285 ms | 12.9 M |
+| vello 0.9 | 1.083 ms | — |
+| **engine (`--overlap`)** | **0.0686 ms** | **1.07 M** |
+
+Dense overlap is where the depth-based opaque path pays off hardest: opaque
+groups draw front-to-back (nearest group first, preserving instancing), so
+early-z rejects ~12x the fragment work the control shades. Honest limits:
+the win applies to opaque content — translucent stacks blend per layer like
+every rasterizer — and crossing AA fringes of different shapes can
+double-blend (conflation), invisible in HUDs, occasionally visible in
+dense art; rive's interlock avoids it, vello's area AA has its own
+conflation artifacts.
+
 Not yet measured: Skia, Pathfinder (different stacks, standalone
-harnesses), rive native on workloads 2-3, and workload 4 (stroke stress).
+harnesses), rive native on workloads 2-3 and overlap, and workload 4
+(stroke stress).
 
 The engine wins by structure, not tuning:
 
