@@ -186,7 +186,13 @@ fn extract_vello_shapes(
                     bevy_pf_vector::LineJoin::Bevel => Join::Bevel,
                 };
                 (
-                    Stroke::new(f64::from(stroke.width)).with_caps(cap).with_join(join),
+                    {
+                        let mut s = Stroke::new(f64::from(stroke.width)).with_caps(cap).with_join(join);
+                        if let Some([on, off]) = stroke.dash {
+                            s = s.with_dashes(0.0, [f64::from(on), f64::from(off)]);
+                        }
+                        s
+                    },
                     to_bez_path(&shape.commands),
                     to_vello_color(stroke.color),
                 )

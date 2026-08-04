@@ -105,6 +105,15 @@ from any reference renderer:
   the reproducibility artifact.
 - Skia / Pathfinder: unmeasured, would need standalone harnesses.
 
+## Workload 4: WON (2026-08-03) — suite complete
+
+StrokeStyle.dash + kurbo stroke expansion (dash/join/cap correct) ->
+fill-tessellated once; undashed strokes stay on lyon. 300 strokes p50:
+engine 0.81 ms frame / 0.0236 GPU; vello 1.33 / 0.833; control cannot
+run it. All four ARCHITECTURE workloads + overlap stress now measured
+and won on every backend able to compete. Remaining frontier: rive
+native on W2-4, Skia/Pathfinder harnesses, AMD/Intel/Metal.
+
 ## Workload 3: WON (2026-08-03)
 
 Analytic clip chains: VectorClipShape (rounded-rect/circle) entities +

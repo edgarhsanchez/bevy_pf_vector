@@ -61,6 +61,8 @@ struct BenchConfig {
     clips: u32,
     /// Overlap stress: cluster all elements in a small central disc.
     overlap: bool,
+    /// Workload 4: N stroked paths (mixed joins/caps, half dashed).
+    strokes: u32,
     warmup: u32,
     frames: u32,
     out_dir: PathBuf,
@@ -79,6 +81,7 @@ fn parse_args() -> BenchConfig {
     let mut label = None;
     let mut screenshot = false;
     let mut overlap = false;
+    let mut strokes = 0u32;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -105,12 +108,15 @@ fn parse_args() -> BenchConfig {
             "--label" => label = Some(value()),
             "--screenshot" => screenshot = true,
             "--overlap" => overlap = true,
+            "--strokes" => strokes = value().parse().expect("--strokes"),
             other => panic!("unknown argument '{other}'"),
         }
     }
 
     let label = label.unwrap_or_else(|| {
-        if overlap {
+        if strokes > 0 {
+            format!("{}_{}strk_{}f", backend.name(), strokes, frames)
+        } else if overlap {
             format!("{}_{}el_ovl_{}f", backend.name(), elements, frames)
         } else if clips > 0 {
             format!("{}_{}el_{}clips_{}f", backend.name(), elements, clips, frames)
@@ -120,7 +126,7 @@ fn parse_args() -> BenchConfig {
             format!("{}_{}el_{}f", backend.name(), elements, frames)
         }
     });
-    BenchConfig { backend, elements, dynamic, clips, overlap, warmup, frames, out_dir, label, screenshot }
+    BenchConfig { backend, elements, dynamic, clips, overlap, strokes, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -381,6 +387,68 @@ fn setup_shapes(mut commands: Commands, cfg: Res<BenchConfig>) {
     }
 }
 
+/// Workload 4: stroke stress. N stroked paths — wavy polylines and circles
+/// with cycled joins (miter/round/bevel) and caps (butt/round/square), half
+/// of them dashed. Engine tessellates each stroke once (dashed via kurbo
+/// stroke expansion); vello strokes per frame with its native dash support.
+fn setup_stroke_workload(mut commands: Commands, cfg: Res<BenchConfig>) {
+    use bevy_pf_vector::{LineCap, LineJoin, PathCommand, PathStyle, StrokeStyle, VectorShape};
+    use paths::circle_path;
+    if cfg.strokes == 0 {
+        return;
+    }
+    let mut rng = Rng(0x57_20_4B);
+    for i in 0..cfg.strokes {
+        let (pos, size) = layout(i, cfg.strokes, &mut rng, cfg.overlap);
+        let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize].to_linear();
+        let (transform, anim) = animated(pos, 1.0, &mut rng);
+        let width = rng.range(0.12, 0.3) * size;
+        let join = match i % 3 {
+            0 => LineJoin::Miter,
+            1 => LineJoin::Round,
+            _ => LineJoin::Bevel,
+        };
+        let cap = match (i / 3) % 3 {
+            0 => LineCap::Butt,
+            1 => LineCap::Round,
+            _ => LineCap::Square,
+        };
+        let dash = (i % 2 == 0).then_some([width * 2.4, width * 1.6]);
+        let commands_path = if i % 5 == 4 {
+            // Stroked (often dashed) circle — tick-ring look.
+            circle_path(size)
+        } else {
+            // Wavy polyline with sharp direction changes to stress joins.
+            let mut path = Vec::new();
+            let span = 3.2 * size;
+            let segments = 8;
+            for s in 0..=segments {
+                let t = s as f32 / segments as f32;
+                let x = -span / 2.0 + span * t;
+                let y = size * 0.8 * ops::sin(t * 9.4 + i as f32);
+                let command = if s == 0 {
+                    PathCommand::MoveTo(Vec2::new(x, y))
+                } else {
+                    PathCommand::LineTo(Vec2::new(x, y))
+                };
+                path.push(command);
+            }
+            path
+        };
+        commands.spawn((
+            VectorShape {
+                commands: commands_path,
+                style: PathStyle {
+                    fill: None,
+                    stroke: Some(StrokeStyle { color, width, join, cap, dash }),
+                },
+            },
+            transform,
+            anim,
+        ));
+    }
+}
+
 /// Workload 3: nested clips. One outer rounded-rect "safe area", `clips`
 /// rounded-rect panels inside it, and `elements` shapes distributed across
 /// the panels — every shape clipped by its panel, every panel clipped by the
@@ -489,7 +557,7 @@ fn stroke(color: LinearRgba, width: f32) -> bevy_pf_vector::PathStyle {
     use bevy_pf_vector::{LineCap, LineJoin, StrokeStyle};
     bevy_pf_vector::PathStyle {
         fill: None,
-        stroke: Some(StrokeStyle { color, width, join: LineJoin::Round, cap: LineCap::Round }),
+        stroke: Some(StrokeStyle { color, width, join: LineJoin::Round, cap: LineCap::Round, dash: None }),
     }
 }
 mod paths {
@@ -569,8 +637,8 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
     // rendering is part of its shipped configuration, as MSAA 4x is part of
     // the control's.
     commands.spawn((Camera2d, bevy::render::view::Msaa::Off));
-    if cfg.clips > 0 {
-        // Workload 3 replaces the standard content; see setup_clip_workload.
+    if cfg.clips > 0 || cfg.strokes > 0 {
+        // Workloads 3/4 replace the standard content.
         return;
     }
     let mut rng = Rng(0xB3_59_1D);
@@ -854,9 +922,9 @@ fn finish(cfg: &BenchConfig, state: &BenchState, adapter: &str) {
 
 fn main() {
     let cfg = parse_args();
-    if cfg.clips > 0 && !matches!(cfg.backend, Backend::Engine | Backend::Vello) {
+    if (cfg.clips > 0 || cfg.strokes > 0) && !matches!(cfg.backend, Backend::Engine | Backend::Vello) {
         panic!(
-            "workload 3 (--clips) requires --backend engine|vello: '{}' has no clipping support",
+            "workloads 3/4 (--clips/--strokes) require --backend engine|vello: '{}' lacks the features",
             cfg.backend.name()
         );
     }
@@ -911,12 +979,12 @@ fn main() {
         Backend::Sprites => app.add_systems(Startup, setup_sprites),
         Backend::Engine => app
             .add_plugins(bevy_pf_vector::PfVectorPlugin)
-            .add_systems(Startup, (setup_engine, setup_clip_workload))
+            .add_systems(Startup, (setup_engine, setup_clip_workload, setup_stroke_workload))
             .add_systems(Update, animate_arcs_param.after(animate).before(sample)),
         // Same VectorShape entities as the engine backend, rendered by vello.
         Backend::Vello => app
             .add_plugins(vello_backend::VelloBackendPlugin)
-            .add_systems(Startup, (setup_engine, setup_clip_workload))
+            .add_systems(Startup, (setup_engine, setup_clip_workload, setup_stroke_workload))
             .add_systems(Update, animate_arcs.after(animate).before(sample)),
     };
 

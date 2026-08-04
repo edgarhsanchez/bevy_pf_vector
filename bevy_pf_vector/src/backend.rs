@@ -31,6 +31,9 @@ pub struct StrokeStyle {
     pub width: f32,
     pub join: LineJoin,
     pub cap: LineCap,
+    /// Dash pattern as (on, off) lengths in local units. Dashed strokes are
+    /// expanded via kurbo and fill-tessellated — still tessellate-once.
+    pub dash: Option<[f32; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

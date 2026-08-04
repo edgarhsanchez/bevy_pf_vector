@@ -186,6 +186,94 @@ pub fn tessellate_stroke(
     commands: &[PathCommand],
     stroke: &StrokeStyle,
 ) -> Option<TessellatedGeometry> {
+    // Dashed strokes: expand to a fill outline with kurbo (handles dashing,
+    // joins, caps), then fill-tessellate the outline. Still once per shape.
+    if let Some([on, off]) = stroke.dash {
+        use kurbo::{PathEl, Point};
+        let p = |v: bevy::math::Vec2| Point::new(f64::from(v.x), f64::from(v.y));
+        let els: Vec<PathEl> = commands
+            .iter()
+            .map(|command| match *command {
+                PathCommand::MoveTo(to) => PathEl::MoveTo(p(to)),
+                PathCommand::LineTo(to) => PathEl::LineTo(p(to)),
+                PathCommand::QuadTo { ctrl, to } => PathEl::QuadTo(p(ctrl), p(to)),
+                PathCommand::CubicTo { ctrl1, ctrl2, to } => {
+                    PathEl::CurveTo(p(ctrl1), p(ctrl2), p(to))
+                }
+                PathCommand::Close => PathEl::ClosePath,
+            })
+            .collect();
+        let cap = match stroke.cap {
+            LineCap::Butt => kurbo::Cap::Butt,
+            LineCap::Round => kurbo::Cap::Round,
+            LineCap::Square => kurbo::Cap::Square,
+        };
+        let join = match stroke.join {
+            LineJoin::Miter => kurbo::Join::Miter,
+            LineJoin::Round => kurbo::Join::Round,
+            LineJoin::Bevel => kurbo::Join::Bevel,
+        };
+        let style = kurbo::Stroke::new(f64::from(stroke.width))
+            .with_caps(cap)
+            .with_join(join)
+            .with_dashes(0.0, [f64::from(on.max(0.01)), f64::from(off.max(0.01))]);
+        let outline = kurbo::stroke(
+            els,
+            &style,
+            &kurbo::StrokeOpts::default(),
+            f64::from(TOLERANCE),
+        );
+
+        let mut builder = Path::builder();
+        let mut open = false;
+        let q = |pt: Point| point(pt.x as f32, pt.y as f32);
+        for el in outline.elements() {
+            match *el {
+                kurbo::PathEl::MoveTo(a) => {
+                    if open {
+                        builder.end(false);
+                    }
+                    builder.begin(q(a));
+                    open = true;
+                }
+                kurbo::PathEl::LineTo(a) => {
+                    if open {
+                        builder.line_to(q(a));
+                    }
+                }
+                kurbo::PathEl::QuadTo(c, a) => {
+                    if open {
+                        builder.quadratic_bezier_to(q(c), q(a));
+                    }
+                }
+                kurbo::PathEl::CurveTo(c1, c2, a) => {
+                    if open {
+                        builder.cubic_bezier_to(q(c1), q(c2), q(a));
+                    }
+                }
+                kurbo::PathEl::ClosePath => {
+                    if open {
+                        builder.end(true);
+                        open = false;
+                    }
+                }
+            }
+        }
+        if open {
+            builder.end(false);
+        }
+        let outline_path = builder.build();
+        let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+        FillTessellator::new()
+            .tessellate_path(
+                &outline_path,
+                &FillOptions::tolerance(TOLERANCE),
+                &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| v.position().to_array()),
+            )
+            .ok()?;
+        return (!buffers.indices.is_empty()).then(|| build_geometry(buffers.vertices, buffers.indices));
+    }
+
     let path = build_path(commands);
     let cap = match stroke.cap {
         LineCap::Butt => LyonCap::Butt,
@@ -237,6 +325,10 @@ pub fn stroke_key(commands: &[PathCommand], stroke: &StrokeStyle) -> u64 {
     stroke.width.to_bits().hash(&mut hasher);
     (stroke.join as u8).hash(&mut hasher);
     (stroke.cap as u8).hash(&mut hasher);
+    if let Some([on, off]) = stroke.dash {
+        on.to_bits().hash(&mut hasher);
+        off.to_bits().hash(&mut hasher);
+    }
     hash_commands(commands, &mut hasher);
     hasher.finish()
 }

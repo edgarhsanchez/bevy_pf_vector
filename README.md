@@ -150,9 +150,25 @@ double-blend (conflation), invisible in HUDs, occasionally visible in
 dense art; rive's interlock avoids it, vello's area AA has its own
 conflation artifacts.
 
-Not yet measured: Skia, Pathfinder (different stacks, standalone
-harnesses), rive native on workloads 2-3 and overlap, and workload 4
-(stroke stress).
+## Workload 4 results (stroke stress: 300 stroked paths, cycled
+## miter/round/bevel joins and butt/round/square caps, half dashed — p50)
+
+| backend | frame | render GPU |
+|---|---|---|
+| shapes control | not supported (no polyline strokes/joins/dashes) | — |
+| vello 0.9 (native dashed strokes) | 1.33 ms | 0.833 ms |
+| **engine (`--strokes 300`)** | **0.81 ms** | **0.0236 ms** |
+
+`StrokeStyle` now supports `dash: Some([on, off])`: dashed strokes expand to
+fill outlines via kurbo stroke expansion (real joins, caps, dashes) and
+tessellate once like everything else; undashed strokes keep the direct lyon
+path. Joins and caps are honored exactly — the correctness gap
+ARCHITECTURE.md called out in rive-bevy (which forces round joins/caps).
+
+With this, all four workloads of the ARCHITECTURE.md suite plus overlap
+stress are measured. The engine wins every workload against every opponent
+able to run it. Not yet measured: Skia, Pathfinder (standalone harnesses),
+rive native beyond workload 1, and non-NVIDIA GPUs.
 
 The engine wins by structure, not tuning:
 
