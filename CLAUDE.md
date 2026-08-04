@@ -165,6 +165,24 @@ is PARAMETRIC INSTANCED PRIMITIVES: canonical (t, side) strip meshes whose
 vertex shader computes arc/bar geometry from per-instance params — makes
 parameter animation zero-CPU and should win workload-2 frame time outright.
 
+## friginrain2 integration status (2026-08-03)
+
+PfVectorPlugin is live in the game (D:\github\friginrain2, runtime.rs
+beside Shape2dPlugin; commit c9abaa7 there). Full game type-checks and
+boots with the engine active (18s smoke run, real gameplay systems
+ticking, no engine-related errors). Migration surface mapped from their
+code: dialogs/HUD draw via IMMEDIATE-MODE ShapePainter with RenderLayers
+(frizbi_dialog/mod.rs draw_chrome etc.). Porting them 1:1 needs two
+engine features, in order:
+1. RenderLayers-aware extraction (per-view filtering; today all
+   VectorShapes draw on every 2D camera) — hard prerequisite.
+2. An immediate-mode painter API (per-frame command list -> transient
+   instances; our dynamic/parametric paths make this cheap).
+Then: port frizbi_dialog chrome as the template, and wire bevy_pf''s
+shapes.rs (its docs reserve a GPU-backend seam; currently tiny-skia CPU
+rasterization into UI images — correct integration is UI-render-phase
+injection or per-shape render-to-texture, needing RenderLayers too).
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
