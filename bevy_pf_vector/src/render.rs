@@ -49,7 +49,7 @@ use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
 use bevy::shader::Shader;
 
 use crate::tess;
-use crate::{ClippedBy, VectorClipShape, VectorPrimitive, VectorShape};
+use crate::{ClippedBy, HudTransform, VectorClipShape, VectorPrimitive, VectorShape};
 
 pub const VECTOR_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("7a3f1c2e-9b4d-4b8a-a2f0-5e1d3c6b9f01");
@@ -645,7 +645,10 @@ fn pack_color(color: LinearRgba) -> [u8; 4] {
 /// transient region instead — dynamic topology works, priced per changed
 /// shape, without poisoning the cache.
 fn extract_shapes(
-    shapes: Extract<Query<(Ref<VectorShape>, &GlobalTransform, Option<&ClippedBy>)>>,
+    shapes: Extract<
+        Query<(Ref<VectorShape>, &GlobalTransform, Option<&ClippedBy>), Without<HudTransform>>,
+    >,
+    flat_shapes: Extract<Query<(Ref<VectorShape>, &HudTransform, Option<&ClippedBy>)>>,
     clips: Res<ExtractedClips>,
     mut cache: ResMut<GeometryCache>,
     mut extracted: ResMut<ExtractedShapes>,
@@ -661,10 +664,6 @@ fn extract_shapes(
     }
 
     for (shape, transform, clipped) in &shapes {
-        let clip = clipped
-            .and_then(|c| clips.chains.get(&c.0))
-            .map(|&(start, count)| pack_clip(start, count))
-            .unwrap_or(0.0);
         let model = transform.to_matrix();
         let linear = [
             model.x_axis.x,
@@ -673,7 +672,39 @@ fn extract_shapes(
             model.y_axis.y,
         ];
         let translation = [model.w_axis.x, model.w_axis.y];
-        let z = model.w_axis.z;
+        push_shape(
+            &mut cache,
+            &mut extracted,
+            &clips,
+            &shape,
+            linear,
+            translation,
+            model.w_axis.z,
+            clipped,
+        );
+    }
+    for (shape, hud, clipped) in &flat_shapes {
+        let (linear, translation, z) = hud.decompose();
+        push_shape(&mut cache, &mut extracted, &clips, &shape, linear, translation, z, clipped);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_shape(
+    cache: &mut GeometryCache,
+    extracted: &mut ExtractedShapes,
+    clips: &ExtractedClips,
+    shape: &Ref<VectorShape>,
+    linear: [f32; 4],
+    translation: [f32; 2],
+    z: f32,
+    clipped: Option<&ClippedBy>,
+) {
+    let clip = clipped
+        .and_then(|c| clips.chains.get(&c.0))
+        .map(|&(start, count)| pack_clip(start, count))
+        .unwrap_or(0.0);
+    {
         // `is_changed` is true on the frame a path/style mutates (and on
         // spawn); those shapes skip the cache entirely this frame.
         let dynamic = shape.is_changed();
@@ -725,6 +756,33 @@ fn extract_shapes(
     }
 }
 
+/// Shared per-item processing for both transform sources.
+#[allow(clippy::too_many_arguments)]
+fn push_primitive(
+    extracted: &mut ExtractedParametrics,
+    clips: &ExtractedClips,
+    primitive: &VectorPrimitive,
+    linear: [f32; 4],
+    translation: [f32; 2],
+    z: f32,
+    clipped: Option<&ClippedBy>,
+) {
+    let clip = clipped
+        .and_then(|c| clips.chains.get(&c.0))
+        .map(|&(start, count)| pack_clip(start, count))
+        .unwrap_or(0.0);
+    let VectorPrimitive::Arc { inner, outer, start, sweep, color } = *primitive;
+    extracted.0.push(ParamItem {
+        z,
+        linear,
+        translation,
+        color: pack_color(color),
+        params: [start, sweep, inner, outer],
+        opaque: color.alpha >= 1.0 && clip == 0.0,
+        clip,
+    });
+}
+
 fn queue_vector_pipelines(
     mut pipeline: ResMut<VectorPipeline>,
     cache: Res<PipelineCache>,
@@ -741,7 +799,13 @@ fn queue_vector_pipelines(
 /// Resolves clip entities into per-frame SDF entries and chains. Runs before
 /// shape/primitive extraction so instances can reference chains by index.
 fn extract_clips(
-    clips: Extract<Query<(Entity, &VectorClipShape, &GlobalTransform, Option<&ClippedBy>)>>,
+    clips: Extract<
+        Query<
+            (Entity, &VectorClipShape, &GlobalTransform, Option<&ClippedBy>),
+            Without<HudTransform>,
+        >,
+    >,
+    flat_clips: Extract<Query<(Entity, &VectorClipShape, &HudTransform, Option<&ClippedBy>)>>,
     mut extracted: ResMut<ExtractedClips>,
 ) {
     extracted.entries.clear();
@@ -751,6 +815,32 @@ fn extract_clips(
         entry: GpuClip,
         parent: Option<Entity>,
     }
+    fn clip_node(
+        shape: &VectorClipShape,
+        linear: Mat2,
+        translation: Vec2,
+        parent: Option<&ClippedBy>,
+    ) -> ClipNode {
+        let inverse = linear.inverse();
+        let inv_translation = -(inverse * translation);
+        let (half_extents, radius) = match *shape {
+            VectorClipShape::RoundedRect { half_extents, radius } => {
+                ([half_extents.x - radius, half_extents.y - radius], radius)
+            }
+            VectorClipShape::Circle { radius } => ([0.0, 0.0], radius),
+        };
+        ClipNode {
+            entry: GpuClip {
+                inv_linear: inverse.to_cols_array(),
+                inv_translation: inv_translation.to_array(),
+                half_extents,
+                radius,
+                _pad: [0.0; 3],
+            },
+            parent: parent.map(|p| p.0),
+        }
+    }
+
     let mut nodes: HashMap<Entity, ClipNode> = HashMap::default();
     for (entity, shape, transform, parent) in &clips {
         let model = transform.to_matrix();
@@ -760,27 +850,19 @@ fn extract_clips(
             model.y_axis.x,
             model.y_axis.y,
         ]);
-        let inverse = linear.inverse();
         let translation = Vec2::new(model.w_axis.x, model.w_axis.y);
-        let inv_translation = -(inverse * translation);
-        let (half_extents, radius) = match *shape {
-            VectorClipShape::RoundedRect { half_extents, radius } => {
-                ([half_extents.x - radius, half_extents.y - radius], radius)
-            }
-            VectorClipShape::Circle { radius } => ([0.0, 0.0], radius),
-        };
+        nodes.insert(entity, clip_node(shape, linear, translation, parent));
+    }
+    for (entity, shape, hud, parent) in &flat_clips {
+        let (linear, translation, _z) = hud.decompose();
         nodes.insert(
             entity,
-            ClipNode {
-                entry: GpuClip {
-                    inv_linear: inverse.to_cols_array(),
-                    inv_translation: inv_translation.to_array(),
-                    half_extents,
-                    radius,
-                    _pad: [0.0; 3],
-                },
-                parent: parent.map(|p| p.0),
-            },
+            clip_node(
+                shape,
+                Mat2::from_cols_array(&linear),
+                Vec2::new(translation[0], translation[1]),
+                parent,
+            ),
         );
     }
 
@@ -809,27 +891,29 @@ fn extract_clips(
 /// Copies parametric primitives into the render world — pure instance data,
 /// no geometry work of any kind.
 fn extract_primitives(
-    primitives: Extract<Query<(&VectorPrimitive, &GlobalTransform, Option<&ClippedBy>)>>,
+    primitives: Extract<
+        Query<(&VectorPrimitive, &GlobalTransform, Option<&ClippedBy>), Without<HudTransform>>,
+    >,
+    flat_primitives: Extract<Query<(&VectorPrimitive, &HudTransform, Option<&ClippedBy>)>>,
     clips: Res<ExtractedClips>,
     mut extracted: ResMut<ExtractedParametrics>,
 ) {
     extracted.0.clear();
     for (primitive, transform, clipped) in &primitives {
-        let clip = clipped
-            .and_then(|c| clips.chains.get(&c.0))
-            .map(|&(start, count)| pack_clip(start, count))
-            .unwrap_or(0.0);
         let model = transform.to_matrix();
-        let VectorPrimitive::Arc { inner, outer, start, sweep, color } = *primitive;
-        extracted.0.push(ParamItem {
-            z: model.w_axis.z,
-            linear: [model.x_axis.x, model.x_axis.y, model.y_axis.x, model.y_axis.y],
-            translation: [model.w_axis.x, model.w_axis.y],
-            color: pack_color(color),
-            params: [start, sweep, inner, outer],
-            opaque: color.alpha >= 1.0 && clip == 0.0,
-            clip,
-        });
+        push_primitive(
+            &mut extracted,
+            &clips,
+            primitive,
+            [model.x_axis.x, model.x_axis.y, model.y_axis.x, model.y_axis.y],
+            [model.w_axis.x, model.w_axis.y],
+            model.w_axis.z,
+            clipped,
+        );
+    }
+    for (primitive, hud, clipped) in &flat_primitives {
+        let (linear, translation, z) = hud.decompose();
+        push_primitive(&mut extracted, &clips, primitive, linear, translation, z, clipped);
     }
 }
 
@@ -979,7 +1063,7 @@ fn prepare_vector_buffers(
     buffers.blend_batches.clear();
 
     let mut instances: Vec<GpuInstance> = Vec::with_capacity(extracted.items.len() * 2);
-    let mut push_instance = |instances: &mut Vec<GpuInstance>,
+    let push_instance = |instances: &mut Vec<GpuInstance>,
                              permutation: &mut Vec<u32>,
                              item_index: usize,
                              item: &ExtractedInstance|

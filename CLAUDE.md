@@ -167,10 +167,12 @@ parameter animation zero-CPU and should win workload-2 frame time outright.
 
 ## Next tasks
 
-- Bevy-overhead levers (renderer is no longer the frame bottleneck at 5000
-  el — 1.45 ms frame vs 0.137 ms GPU): opt-in flat `HudTransform` component
-  bypassing Transform/GlobalTransform propagation for non-hierarchical HUD
-  entities; change-detection extraction + persistent instance slots for
+- DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
+  frame at 5000 el — Bevy propagation is well parallelized so the honest
+  win is small). Dead scaffolding removed: node.rs (superseded stub) and
+  the never-implemented VectorBackend seam trait (its purpose left with
+  path A; backend.rs renamed path.rs holding the authoring types). Still
+  future: change-detection extraction + persistent instance slots for
   mostly-static HUDs. Prepare already skips sort/batch/indirect rebuilds
   via a layout fingerprint (rebuilds only when count/geometry/z/opacity
   change); upstreaming a static-transform fast path to Bevy is the

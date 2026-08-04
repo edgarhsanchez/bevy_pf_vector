@@ -69,13 +69,15 @@ conceded and kept out of scope, decided per-workload by benchmark evidence.
 
     bevy_pf_vector/
       src/
-        lib.rs        plugin registration, VectorShape authoring component
-        backend.rs    VectorBackend trait — the seam engine iterations implement
-        node.rs       vector_pass system for the 0.19 RenderGraph schedule
+        lib.rs        plugin, authoring components (VectorShape, VectorPrimitive,
+                      VectorClipShape/ClippedBy, HudTransform)
+        path.rs       PathCommand / PathStyle / StrokeStyle authoring types
+        tess.rs       lyon/kurbo tessellation + AA fringe generation
+        render.rs     extraction, buffers, pipelines, the vector pass
 
-The `VectorBackend` trait is the important artifact. If it is drawn correctly,
-alternative engine implementations are swappable at runtime and benchmarkable
-head-to-head in the same frame loop.
+The original `VectorBackend` seam existed to swap path C and path A at
+runtime; with path A removed it was dead API and has been deleted — engine
+variants are compared through the benchmark harness instead.
 
 ## 4. Benchmark plan — write this before the renderer
 

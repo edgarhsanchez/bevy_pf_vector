@@ -63,6 +63,8 @@ struct BenchConfig {
     overlap: bool,
     /// Workload 4: N stroked paths (mixed joins/caps, half dashed).
     strokes: u32,
+    /// Engine only: animate via flat HudTransform (no hierarchy propagation).
+    flat: bool,
     warmup: u32,
     frames: u32,
     out_dir: PathBuf,
@@ -82,6 +84,7 @@ fn parse_args() -> BenchConfig {
     let mut screenshot = false;
     let mut overlap = false;
     let mut strokes = 0u32;
+    let mut flat = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -108,6 +111,7 @@ fn parse_args() -> BenchConfig {
             "--label" => label = Some(value()),
             "--screenshot" => screenshot = true,
             "--overlap" => overlap = true,
+            "--flat" => flat = true,
             "--strokes" => strokes = value().parse().expect("--strokes"),
             other => panic!("unknown argument '{other}'"),
         }
@@ -116,6 +120,8 @@ fn parse_args() -> BenchConfig {
     let label = label.unwrap_or_else(|| {
         if strokes > 0 {
             format!("{}_{}strk_{}f", backend.name(), strokes, frames)
+        } else if flat {
+            format!("{}_{}el_flat_{}f", backend.name(), elements, frames)
         } else if overlap {
             format!("{}_{}el_ovl_{}f", backend.name(), elements, frames)
         } else if clips > 0 {
@@ -126,7 +132,7 @@ fn parse_args() -> BenchConfig {
             format!("{}_{}el_{}f", backend.name(), elements, frames)
         }
     });
-    BenchConfig { backend, elements, dynamic, clips, overlap, strokes, warmup, frames, out_dir, label, screenshot }
+    BenchConfig { backend, elements, dynamic, clips, overlap, strokes, flat, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -718,11 +724,23 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
                 }
             }
         };
-        commands.spawn((shape, transform, anim));
+        if cfg.flat {
+            let hud = bevy_pf_vector::HudTransform {
+                translation: anim.translation,
+                rotation: anim.base_rotation,
+                scale: Vec2::splat(anim.base_scale),
+            };
+            commands.spawn((shape, hud, anim));
+        } else {
+            commands.spawn((shape, transform, anim));
+        }
     }
 }
 
-fn animate(mut frame: ResMut<FrameCount>, mut query: Query<(&Animated, &mut Transform)>) {
+fn animate(
+    mut frame: ResMut<FrameCount>,
+    mut query: Query<(&Animated, &mut Transform), Without<bevy_pf_vector::HudTransform>>,
+) {
     frame.0 += 1;
     // Virtual time: 1/120 s per frame regardless of real frame rate.
     let t = frame.0 as f32 / 120.0;
@@ -734,6 +752,22 @@ fn animate(mut frame: ResMut<FrameCount>, mut query: Query<(&Animated, &mut Tran
         *transform = Transform::from_translation(anim.translation)
             .with_rotation(Quat::from_rotation_z(angle))
             .with_scale(Vec3::splat(scale));
+    });
+}
+
+/// Flat-transform variant: animates HudTransform, leaving Transform (and
+/// therefore Bevy's propagation systems) untouched.
+fn animate_flat(
+    frame: Res<FrameCount>,
+    mut query: Query<(&Animated, &mut bevy_pf_vector::HudTransform)>,
+) {
+    let t = frame.0 as f32 / 120.0;
+    query.par_iter_mut().for_each(|(anim, mut hud)| {
+        hud.rotation = anim.base_rotation + 0.35 * ops::sin(t * anim.speed + anim.phase);
+        hud.scale = Vec2::splat(
+            anim.base_scale * (1.0 + 0.05 * ops::sin(t * anim.speed * 1.7 + anim.phase)),
+        );
+        hud.translation = anim.translation;
     });
 }
 
@@ -980,7 +1014,10 @@ fn main() {
         Backend::Engine => app
             .add_plugins(bevy_pf_vector::PfVectorPlugin)
             .add_systems(Startup, (setup_engine, setup_clip_workload, setup_stroke_workload))
-            .add_systems(Update, animate_arcs_param.after(animate).before(sample)),
+            .add_systems(
+                Update,
+                (animate_arcs_param, animate_flat).after(animate).before(sample),
+            ),
         // Same VectorShape entities as the engine backend, rendered by vello.
         Backend::Vello => app
             .add_plugins(vello_backend::VelloBackendPlugin)

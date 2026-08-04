@@ -83,10 +83,11 @@ Renderer-for-renderer the engine is roughly an order of magnitude faster at
 both scales, and our entire Bevy frame at 5000 elements (1.16 ms, ECS and
 all — after layout-fingerprint caching, foldhash keys made prepare a pure gather and the
 benchmark client's animation went parallel; bevy_vector_shapes measured
-with the same client at 3.31 ms) clearly beats the Rive Renderer's render-only loop (1.72 ms). The dominant
-remaining frame cost is Bevy's transform propagation, not the renderer —
-the next lever is an opt-in flat HUD transform path that bypasses the
-hierarchy, plus change-detection extraction for mostly-static HUDs. Rive pays per-frame path
+with the same client at 3.31 ms) clearly beats the Rive Renderer's render-only loop (1.72 ms). An opt-in flat
+`HudTransform` component now exists for hierarchy-free HUD elements
+(animating it never dirties the transform graph; measured ~3% frame gain at
+5000 animated elements — Bevy 0.19's propagation is already well
+parallelized, so the win is modest and honest). Rive pays per-frame path
 processing and flush work by design — the cost this engine's
 tessellate-once model eliminates. Caveats: rive numbers are frame-time (its
 loop is render-only, but CPU/GPU overlap means GPU-only could be lower);

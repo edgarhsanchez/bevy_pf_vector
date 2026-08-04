@@ -10,7 +10,7 @@ use lyon::tessellation::{
     LineJoin as LyonJoin, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers,
 };
 
-use crate::backend::{LineCap, LineJoin, PathCommand, StrokeStyle};
+use crate::path::{LineCap, LineJoin, PathCommand, StrokeStyle};
 
 /// Max distance in local units between a curve and its flattened form.
 /// Shapes are authored in pixel-scale units, so this is ~1/4 px.
