@@ -57,6 +57,8 @@ pub const VECTOR_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("7a3f1c2e-9b4d-4b8a-a2f0-5e1d3c6b9f01");
 pub const VECTOR_PARAM_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("2c8e5b1a-4f7d-4c3e-9a06-8b21d75c4e90");
+pub const VECTOR_SDF_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("5d1b7f34-0a62-4e19-8c7d-3f9e2a4b6c81");
 
 pub struct VectorRenderPlugin;
 
@@ -69,6 +71,12 @@ impl Plugin for VectorRenderPlugin {
             "vector_param.wgsl",
             Shader::from_wgsl
         );
+        load_internal_asset!(
+            app,
+            VECTOR_SDF_SHADER_HANDLE,
+            "vector_sdf.wgsl",
+            Shader::from_wgsl
+        );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -77,6 +85,7 @@ impl Plugin for VectorRenderPlugin {
             .init_resource::<GeometryCache>()
             .init_resource::<ExtractedShapes>()
             .init_resource::<ExtractedParametrics>()
+            .init_resource::<ExtractedSdf>()
             .init_resource::<ExtractedClips>()
             .init_resource::<LayerTable>()
             .init_resource::<GeometryKeys>()
@@ -94,6 +103,7 @@ impl Plugin for VectorRenderPlugin {
                     queue_vector_pipelines.in_set(RenderSystems::Queue),
                     prepare_vector_buffers.in_set(RenderSystems::PrepareResources),
                     prepare_parametrics.in_set(RenderSystems::PrepareResources),
+                    prepare_sdf.in_set(RenderSystems::PrepareResources),
                     prepare_clips.in_set(RenderSystems::PrepareResources),
                     prepare_gradients.in_set(RenderSystems::PrepareResources),
                     prepare_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
@@ -627,6 +637,12 @@ struct ParamItem {
 #[derive(Resource, Default)]
 pub struct ExtractedParametrics(Vec<ParamItem>);
 
+/// SDF primitives (rect / rounded rect / circle / line). Same instance
+/// layout as the arcs, different mesh and shader: one quad, distance
+/// evaluated per fragment.
+#[derive(Resource, Default)]
+pub struct ExtractedSdf(Vec<ParamItem>);
+
 #[derive(Resource, Default)]
 pub struct VectorBuffers {
     vertex: Option<Buffer>,
@@ -666,6 +682,14 @@ pub struct VectorBuffers {
     /// Contiguous layer-homogeneous runs over the sorted parametric
     /// instances, so per-view filtering can skip whole runs.
     param_layer_runs: Vec<(Range<u32>, u16)>,
+    /// SDF primitives: a unit quad (built once) plus per-frame instances.
+    sdf_vertex: Option<Buffer>,
+    sdf_index: Option<Buffer>,
+    sdf_instance: Option<Buffer>,
+    sdf_instance_capacity: usize,
+    sdf_opaque_count: u32,
+    sdf_total_count: u32,
+    sdf_layer_runs: Vec<(Range<u32>, u16)>,
     /// Fixed-capacity analytic clip storage (created once; bind groups stay
     /// stable), rewritten per frame.
     clip: Option<Buffer>,
@@ -697,6 +721,7 @@ pub struct VectorPipeline {
     view_layout: BindGroupLayoutDescriptor,
     variants: HashMap<(TextureFormat, u32, bool), CachedRenderPipelineId>,
     param_variants: HashMap<(TextureFormat, u32, bool), CachedRenderPipelineId>,
+    sdf_variants: HashMap<(TextureFormat, u32, bool), CachedRenderPipelineId>,
 }
 
 impl Default for VectorPipeline {
@@ -716,6 +741,7 @@ impl Default for VectorPipeline {
             ),
             variants: HashMap::new(),
             param_variants: HashMap::new(),
+            sdf_variants: HashMap::new(),
         }
     }
 }
@@ -829,6 +855,68 @@ impl VectorPipeline {
                     zero_initialize_workgroup_memory: false,
                 })
             })
+    }
+
+    fn ensure_sdf(
+        &mut self,
+        cache: &PipelineCache,
+        format: TextureFormat,
+        samples: u32,
+        opaque: bool,
+    ) -> CachedRenderPipelineId {
+        let view_layout = self.view_layout.clone();
+        *self
+            .sdf_variants
+            .entry((format, samples, opaque))
+            .or_insert_with(|| {
+                cache.queue_render_pipeline(RenderPipelineDescriptor {
+                    label: Some(
+                        if opaque { "pf_vector_sdf_opaque_pipeline" } else { "pf_vector_sdf_blend_pipeline" }
+                            .into(),
+                    ),
+                    layout: vec![view_layout],
+                    vertex: VertexState {
+                        shader: VECTOR_SDF_SHADER_HANDLE,
+                        entry_point: Some("vertex".into()),
+                        shader_defs: Vec::new(),
+                        buffers: vec![vertex_buffer_layout(), param_instance_buffer_layout()],
+                    },
+                    fragment: Some(FragmentState {
+                        shader: VECTOR_SDF_SHADER_HANDLE,
+                        entry_point: Some("fragment".into()),
+                        shader_defs: Vec::new(),
+                        targets: vec![Some(ColorTargetState {
+                            format,
+                            blend: (!opaque).then_some(BlendState::ALPHA_BLENDING),
+                            write_mask: ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: PrimitiveState::default(),
+                    depth_stencil: Some(DepthStencilState {
+                        format: CORE_2D_DEPTH_FORMAT,
+                        depth_write_enabled: Some(opaque),
+                        depth_compare: Some(CompareFunction::GreaterEqual),
+                        stencil: StencilState::default(),
+                        bias: DepthBiasState::default(),
+                    }),
+                    multisample: MultisampleState {
+                        count: samples,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    immediate_size: 0,
+                    zero_initialize_workgroup_memory: false,
+                })
+            })
+    }
+
+    fn get_sdf(
+        &self,
+        format: TextureFormat,
+        samples: u32,
+        opaque: bool,
+    ) -> Option<CachedRenderPipelineId> {
+        self.sdf_variants.get(&(format, samples, opaque)).copied()
     }
 
     fn get(
@@ -1122,6 +1210,7 @@ fn push_shape(
 #[allow(clippy::too_many_arguments)]
 fn push_primitive(
     extracted: &mut ExtractedParametrics,
+    sdf: &mut ExtractedSdf,
     clips: &ExtractedClips,
     primitive: &VectorPrimitive,
     linear: [f32; 4],
@@ -1134,14 +1223,27 @@ fn push_primitive(
         .and_then(|c| clips.chains.get(&c.0))
         .map(|&(start, count)| pack_clip(start, count))
         .unwrap_or(0.0);
-    let VectorPrimitive::Arc { inner, outer, start, sweep, color } = *primitive;
-    extracted.0.push(ParamItem {
+    let (target, params, color) = match *primitive {
+        VectorPrimitive::Arc { inner, outer, start, sweep, color } => {
+            (&mut extracted.0, [start, sweep, inner, outer], color)
+        }
+        VectorPrimitive::Rect { size, radius, thickness, color } => (
+            &mut sdf.0,
+            [size.x, size.y, radius, thickness],
+            color,
+        ),
+    };
+    target.push(ParamItem {
         z,
         linear,
         translation,
         color: pack_color(color),
-        params: [start, sweep, inner, outer],
-        opaque: color.alpha >= 1.0 && clip == 0.0,
+        params,
+        // A stroked SDF primitive is mostly hole, so it always blends; a
+        // filled one can take the opaque path like anything else.
+        opaque: color.alpha >= 1.0
+            && clip == 0.0
+            && !matches!(*primitive, VectorPrimitive::Rect { thickness, .. } if thickness > 0.0),
         clip,
         layer,
     });
@@ -1156,6 +1258,7 @@ fn queue_vector_pipelines(
         for opaque in [true, false] {
             pipeline.ensure(&cache, view.target_format, msaa.samples(), opaque);
             pipeline.ensure_param(&cache, view.target_format, msaa.samples(), opaque);
+            pipeline.ensure_sdf(&cache, view.target_format, msaa.samples(), opaque);
         }
     }
 }
@@ -1267,13 +1370,16 @@ fn extract_primitives(
     painted: Extract<Res<VectorPainterQueue>>,
     clips: Res<ExtractedClips>,
     mut extracted: ResMut<ExtractedParametrics>,
+    mut sdf: ResMut<ExtractedSdf>,
     mut layers: ResMut<LayerTable>,
 ) {
     extracted.0.clear();
+    sdf.0.clear();
     for (primitive, transform, clipped, item_layers) in &primitives {
         let model = transform.to_matrix();
         push_primitive(
             &mut extracted,
+            &mut sdf,
             &clips,
             primitive,
             [model.x_axis.x, model.x_axis.y, model.y_axis.x, model.y_axis.y],
@@ -1287,6 +1393,7 @@ fn extract_primitives(
         let (linear, translation, z) = hud.decompose();
         push_primitive(
             &mut extracted,
+            &mut sdf,
             &clips,
             primitive,
             linear,
@@ -1681,6 +1788,80 @@ fn prepare_parametrics(
     }
 }
 
+/// SDF primitives: a unit quad built once, then a per-frame instance
+/// rewrite. Nothing here scales with shape SIZE — that is the whole point of
+/// the primitive, and why a resizing bar costs one instance write.
+fn prepare_sdf(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut extracted: ResMut<ExtractedSdf>,
+    mut buffers: ResMut<VectorBuffers>,
+) {
+    if extracted.0.is_empty() {
+        buffers.sdf_total_count = 0;
+        buffers.sdf_opaque_count = 0;
+        buffers.sdf_layer_runs.clear();
+        return;
+    }
+    if buffers.sdf_vertex.is_none() {
+        // Unit quad in [-1, 1]; the vertex shader scales it per instance.
+        let corners = [[-1.0f32, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
+        let vertices: Vec<GpuVertex> = corners
+            .iter()
+            .map(|&position| GpuVertex { position, normal: [0.0, 0.0], coverage: 1.0 })
+            .collect();
+        buffers.sdf_vertex = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("pf_vector_sdf_vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: BufferUsages::VERTEX,
+        }));
+        let indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        buffers.sdf_index = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("pf_vector_sdf_indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: BufferUsages::INDEX,
+        }));
+    }
+
+    extracted.0.sort_unstable_by(|a, b| {
+        b.opaque
+            .cmp(&a.opaque)
+            .then_with(|| if a.opaque { a.layer.cmp(&b.layer) } else { std::cmp::Ordering::Equal })
+            .then(a.z.total_cmp(&b.z))
+    });
+    buffers.sdf_layer_runs.clear();
+    for (i, item) in extracted.0.iter().enumerate() {
+        match buffers.sdf_layer_runs.last_mut() {
+            Some((range, layer)) if *layer == item.layer => range.end = i as u32 + 1,
+            _ => buffers.sdf_layer_runs.push((i as u32..i as u32 + 1, item.layer)),
+        }
+    }
+    let instances: Vec<GpuParamInstance> = extracted
+        .0
+        .iter()
+        .map(|item| GpuParamInstance {
+            linear: item.linear,
+            translation_z: [item.translation[0], item.translation[1], item.z, item.clip],
+            color: item.color,
+            params: item.params,
+        })
+        .collect();
+    buffers.sdf_total_count = instances.len() as u32;
+    buffers.sdf_opaque_count = extracted.0.iter().filter(|i| i.opaque).count() as u32;
+
+    let bytes: &[u8] = bytemuck::cast_slice(&instances);
+    if buffers.sdf_instance.is_none() || buffers.sdf_instance_capacity < bytes.len() {
+        buffers.sdf_instance = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("pf_vector_sdf_instances"),
+            contents: bytes,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        }));
+        buffers.sdf_instance_capacity = bytes.len();
+    } else if let Some(buffer) = &buffers.sdf_instance {
+        queue.write_buffer(buffer, 0, bytes);
+    }
+}
+
 /// Uploads this frame's analytic clip entries into the fixed-capacity
 /// storage buffer (created once so view bind groups never churn).
 fn prepare_clips(
@@ -1837,11 +2018,15 @@ fn vector_pass(
         && buffers.vertex.is_some()
         && buffers.index.is_some()
         && buffers.instance.is_some();
+    let has_sdf = buffers.sdf_total_count > 0
+        && buffers.sdf_vertex.is_some()
+        && buffers.sdf_index.is_some()
+        && buffers.sdf_instance.is_some();
     let has_params = buffers.param_total_count > 0
         && buffers.param_vertex.is_some()
         && buffers.param_index.is_some()
         && buffers.param_instance.is_some();
-    if !has_tessellated && !has_params {
+    if !has_tessellated && !has_params && !has_sdf {
         return;
     }
     let view_entity = view.entity();
@@ -1856,10 +2041,13 @@ fn vector_pass(
     let blend_pipeline = get(pipeline.get(format, samples, false));
     let param_opaque_pipeline = get(pipeline.get_param(format, samples, true));
     let param_blend_pipeline = get(pipeline.get_param(format, samples, false));
+    let sdf_opaque_pipeline = get(pipeline.get_sdf(format, samples, true));
+    let sdf_blend_pipeline = get(pipeline.get_sdf(format, samples, false));
+    let sdf_ready = has_sdf && sdf_opaque_pipeline.is_some() && sdf_blend_pipeline.is_some();
     let tess_ready = has_tessellated && opaque_pipeline.is_some() && blend_pipeline.is_some();
     let params_ready =
         has_params && param_opaque_pipeline.is_some() && param_blend_pipeline.is_some();
-    if !tess_ready && !params_ready {
+    if !tess_ready && !params_ready && !sdf_ready {
         // Still compiling; skip the frame rather than stall.
         return;
     }
@@ -1899,6 +2087,16 @@ fn vector_pass(
             pass.set_vertex_buffer(1, buffers.instance.as_ref().unwrap().slice(..));
             pass.set_index_buffer(
                 buffers.index.as_ref().unwrap().slice(..),
+                IndexFormat::Uint32,
+            );
+        }};
+    }
+    macro_rules! bind_sdf {
+        () => {{
+            pass.set_vertex_buffer(0, buffers.sdf_vertex.as_ref().unwrap().slice(..));
+            pass.set_vertex_buffer(1, buffers.sdf_instance.as_ref().unwrap().slice(..));
+            pass.set_index_buffer(
+                buffers.sdf_index.as_ref().unwrap().slice(..),
                 IndexFormat::Uint32,
             );
         }};
@@ -1963,6 +2161,16 @@ fn vector_pass(
         pass.set_render_pipeline(opaque_pipeline.unwrap());
         draw_filtered!(&buffers.opaque_batches, 0);
     }
+    if sdf_ready && buffers.sdf_opaque_count > 0 {
+        bind_sdf!();
+        pass.set_render_pipeline(sdf_opaque_pipeline.unwrap());
+        for (range, layer) in &buffers.sdf_layer_runs {
+            let run = range.start..range.end.min(buffers.sdf_opaque_count);
+            if run.start < run.end && layer_table.visible(*layer, &view_mask) {
+                pass.draw_indexed(0..6, 0, run);
+            }
+        }
+    }
     if params_ready && buffers.param_opaque_count > 0 {
         bind_params!();
         pass.set_render_pipeline(param_opaque_pipeline.unwrap());
@@ -1998,6 +2206,20 @@ fn vector_pass(
         for (range, layer) in &buffers.param_layer_runs {
             if layer_table.visible(*layer, &view_mask) {
                 pass.draw_indexed(ARC_INTERIOR_INDEX_COUNT..index_count, 0, range.clone());
+            }
+        }
+    }
+
+    if sdf_ready {
+        // Translucent SDF primitives, back-to-front within each layer run.
+        // No separate fringe pass: antialiasing is per-fragment here, so the
+        // edge needs no extra geometry.
+        bind_sdf!();
+        pass.set_render_pipeline(sdf_blend_pipeline.unwrap());
+        for (range, layer) in &buffers.sdf_layer_runs {
+            let run = range.start.max(buffers.sdf_opaque_count)..range.end;
+            if run.start < run.end && layer_table.visible(*layer, &view_mask) {
+                pass.draw_indexed(0..6, 0, run);
             }
         }
     }

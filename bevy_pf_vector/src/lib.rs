@@ -86,6 +86,48 @@ pub enum VectorPrimitive {
         sweep: f32,
         color: LinearRgba,
     },
+    /// Rounded rectangle evaluated as a signed distance field: ONE quad,
+    /// no tessellation, and `size` is per-instance — so a bar or meter that
+    /// resizes every frame costs one instance write instead of a fresh
+    /// tessellation. `thickness > 0` strokes inward from the edge;
+    /// `thickness <= 0` fills.
+    ///
+    /// Degenerates into the other primitives, which is why there is only one:
+    /// `radius == 0` is a rect, `radius == min(size)/2` is a circle or
+    /// capsule, and a thin rotated one is a line with round caps. Prefer the
+    /// [`VectorPrimitive::circle`] / [`VectorPrimitive::line`] constructors
+    /// for readability.
+    Rect {
+        size: Vec2,
+        radius: f32,
+        thickness: f32,
+        color: LinearRgba,
+    },
+}
+
+impl VectorPrimitive {
+    /// Filled or stroked circle.
+    pub fn circle(radius: f32, thickness: f32, color: LinearRgba) -> Self {
+        Self::Rect {
+            size: Vec2::splat(radius * 2.0),
+            radius,
+            thickness,
+            color,
+        }
+    }
+
+    /// Line with round caps, as a capsule. The caller positions and rotates
+    /// it with the entity transform; `length` is along local X.
+    pub fn line(length: f32, thickness: f32, color: LinearRgba) -> Self {
+        Self::Rect {
+            size: Vec2::new(length + thickness, thickness),
+            radius: thickness * 0.5,
+            // A capsule is the FILLED shape; stroking it would outline the
+            // line rather than draw it.
+            thickness: 0.0,
+            color,
+        }
+    }
 }
 
 /// A clip region. Entities with this component don't render; content
