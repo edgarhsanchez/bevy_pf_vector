@@ -98,7 +98,12 @@ fn vertex(in: VertexIn) -> VertexOut {
         apply_linear(in.i_linear, dir * radius)
         + vec2<f32>(in.i_translation_z.x, in.i_translation_z.y);
 
-    // One-pixel analytic fringe, resolution- and scale-independent.
+    // Analytic AA band, resolution- and scale-independent, centered on the
+    // authored edge: (0.5 - coverage) sends full-coverage boundary vertices
+    // half a pixel inward and their coverage-0 twins half a pixel outward,
+    // so the arc keeps its authored radii instead of growing by a pixel
+    // (see the matching note in vector.wgsl). Radial and tangential are
+    // perpendicular, so a corner vertex carrying both insets correctly.
     if (in.fringe.x != 0.0 || in.fringe.y != 0.0) {
         let px_world = 2.0 / (view.clip_from_world[0][0] * view.viewport.z);
         var offset = vec2<f32>(0.0, 0.0);
@@ -110,7 +115,7 @@ fn vertex(in: VertexIn) -> VertexOut {
             let tangent = apply_linear(in.i_linear, vec2<f32>(-dir.y, dir.x));
             offset += normalize(tangent) * in.fringe.y;
         }
-        world_xy += offset * px_world;
+        world_xy += offset * px_world * (0.5 - in.coverage);
     }
 
     var out: VertexOut;

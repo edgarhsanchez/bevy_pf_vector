@@ -13,6 +13,7 @@
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 
 use crate::path::{Brush, LineCap, LineJoin, PathCommand, PathStyle, StrokeStyle};
 
@@ -91,6 +92,7 @@ impl Default for PainterConfig {
 pub struct VectorPainter<'w, 's> {
     queue: ResMut<'w, VectorPainterQueue>,
     config: Local<'s, PainterConfig>,
+    windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
 }
 
 impl std::ops::Deref for VectorPainter<'_, '_> {
@@ -110,6 +112,25 @@ impl VectorPainter<'_, '_> {
     /// Reset painter state to defaults (identity transform, layer 0).
     pub fn reset(&mut self) {
         *self.config = PainterConfig::default();
+    }
+
+    /// World units spanning `pixels` physical screen pixels, for the
+    /// standard 2D HUD setup (one world unit per logical pixel — Bevy's
+    /// default `ScalingMode::WindowSize`).
+    ///
+    /// Stroke widths and everything else the painter takes are in world
+    /// units, which is what keeps a HUD's proportions stable across
+    /// resolutions. Use this only where a feature must be a fixed number of
+    /// device pixels regardless of DPI — hairline rules, 1px separators —
+    /// the equivalent of `bevy_vector_shapes`' `ThicknessType::Pixels`.
+    pub fn screen_px(&self, pixels: f32) -> f32 {
+        let scale = self
+            .windows
+            .iter()
+            .next()
+            .map(|window| window.scale_factor())
+            .unwrap_or(1.0);
+        pixels / scale.max(1.0e-6)
     }
 
     /// (2x2 column-major linear, translation.xy, z) of the current transform,

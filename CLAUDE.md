@@ -71,8 +71,11 @@ from any reference renderer:
   fewer fragment invocations than SDF quads)
 - analytic AA: mesh-boundary fringe (boundary edges extracted from the
   tessellation with signed-area orientation correction, averaged outward
-  vertex normals) extruded one screen pixel in the vertex shader —
-  single-sample rendering, no MSAA; engine cameras use Msaa::Off
+  vertex normals) forming a HALF-pixel band on each side of the authored
+  edge — the full-coverage vertex insets 0.5px, its coverage-0 twin
+  extrudes 0.5px, via `(0.5 - coverage)` in the vertex shader; the ramp
+  centers on the edge and covered area is preserved. Single-sample
+  rendering, no MSAA; engine cameras use Msaa::Off
 - opaque/blend split — opaque interiors draw with early-z depth write
   grouped by geometry (order-free under depth), translucent interiors +
   all fringes blend back-to-front
@@ -186,6 +189,43 @@ param + shapes:: -> pf_shapes:: per system. Still legacy: all widgets
 shapes.rs (its docs reserve a GPU-backend seam; currently tiny-skia CPU
 rasterization into UI images — correct integration is UI-render-phase
 injection or per-shape render-to-texture).
+
+## AA band fix + fidelity comparison (2026-08-04)
+
+Found by building a side-by-side harness against the incumbent
+(`hud_component_lab/examples/pf_shapes_compare.rs` in friginrain2: same
+specimens, same frame, legacy left / engine right).
+
+Engine bug it exposed: the fringe extruded a FULL pixel OUTWARD with the
+interior still at full coverage to the boundary — every shape rendered
+~1px larger than authored and thin strokes carried ~2x their weight
+(loud on HUD chrome, which is stacked translucent hairlines). Fix: the
+AA band straddles the edge (see design points above). Applies to both
+the tessellated path (tess.rs stores the outward normal on the interior
+boundary vertex too) and the parametric arc path (canonical mesh interior
+ring/cap vertices carry radial+tangential directions; radial and
+tangential are perpendicular so corner vertices inset correctly).
+Verified against the testbed gizmo ground truth, and it is slightly
+FASTER (fewer covered fragments): W1 200 el 0.0133 ms GPU p50 (was
+0.0143), 5000 el 0.1894 (was 0.1987).
+
+Two things that are NOT engine bugs, both confirmed by pixel
+measurement, worth knowing before porting more game surfaces:
+1. `bevy_vector_shapes`' `ThicknessType::Pixels` is PHYSICAL pixels;
+   engine stroke widths are world units (= logical px under
+   ScalingMode::WindowSize). On the 2x-DPI dev display that made ported
+   strokes 2x heavy until `pf_shapes` routed thicknesses through the new
+   `VectorPainter::screen_px()`.
+2. bevy_vector_shapes SILENTLY DROPS content drawn at the same z as a
+   fill it draws first: across the whole legacy panel the sampled G
+   channel is flat [28..28] — exactly `surface_container`, no overlay
+   contribution — while the engine shows [26..61] (black + cyan
+   scanlines) and the accent underline. So friginrain2's scanlines,
+   accent underlines, and tray avatar circles are authored but have
+   never been visible. Where no overlay exists both render exactly
+   (19,28,34): no color-space discrepancy. PORTING A SURFACE THEREFORE
+   MAKES THAT HIDDEN ART DIRECTION APPEAR — intended by the code, but a
+   visible change to the game.
 
 ## Next tasks
 

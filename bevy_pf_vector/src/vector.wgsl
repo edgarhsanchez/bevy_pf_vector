@@ -100,11 +100,22 @@ fn vertex(in: VertexIn) -> VertexOut {
         in.i_linear.y * in.position.x + in.i_linear.w * in.position.y + in.i_translation_z.y,
     );
 
-    // Fringe displacement: rotate/scale the silhouette normal by the
-    // instance's linear part, renormalize (so instance scale never changes
-    // fringe width), and push outward by one screen pixel expressed in world
-    // units. clip_from_world[0][0] == 2 / world_width for an unrotated 2D
-    // camera, so one pixel is 2 / (clip00 * viewport_width) world units.
+    // Antialiasing band, straddling the true edge. Boundary vertices carry
+    // the outward silhouette normal; the displacement is HALF a screen pixel
+    // scaled by (0.5 - coverage), so the full-coverage vertex moves half a
+    // pixel INWARD and its coverage-0 twin half a pixel OUTWARD. The ramp is
+    // therefore centered on the authored edge: coverage 0.5 exactly on it,
+    // and the shape's covered area is preserved.
+    //
+    // Extruding a full pixel outward without insetting (the naive version)
+    // inflates every shape by a pixel and gives thin strokes about twice
+    // their authored weight — visible immediately when stacking translucent
+    // 1px strokes, which is exactly what HUD chrome does.
+    //
+    // The normal is rotated/scaled by the instance's linear part then
+    // renormalized, so instance scale never changes band width.
+    // clip_from_world[0][0] == 2 / world_width for an unrotated 2D camera,
+    // so one pixel is 2 / (clip00 * viewport_width) world units.
     let world_normal = vec2<f32>(
         in.i_linear.x * in.normal.x + in.i_linear.z * in.normal.y,
         in.i_linear.y * in.normal.x + in.i_linear.w * in.normal.y,
@@ -112,7 +123,7 @@ fn vertex(in: VertexIn) -> VertexOut {
     let len = length(world_normal);
     if (len > 1.0e-6) {
         let px_world = 2.0 / (view.clip_from_world[0][0] * view.viewport.z);
-        world_xy += (world_normal / len) * px_world;
+        world_xy += (world_normal / len) * px_world * (0.5 - in.coverage);
     }
 
     var out: VertexOut;

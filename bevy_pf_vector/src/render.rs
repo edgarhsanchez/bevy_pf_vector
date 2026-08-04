@@ -98,7 +98,17 @@ impl Plugin for VectorRenderPlugin {
                     prepare_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
-            .add_systems(Core2d, vector_pass.in_set(Core2dSystems::EarlyPostProcess));
+            // Prepass slot: vector content draws BEFORE the main 2D pass.
+            // Opaque vector interiors write depth, and Bevy's sprite/text/
+            // mesh2d pipelines depth-test (GreaterEqual, no write), so
+            // main-pass content interleaves with vector content by z: lower-z
+            // sprites are occluded by higher-z opaque vector chrome, higher-z
+            // widgets/text draw over it. Bonus: pixels behind opaque HUD are
+            // early-z culled out of the (expensive) main pass instead of the
+            // other way around. Known limit: TRANSLUCENT vector content
+            // cannot occlude main-pass content above it — keep translucent
+            // vector z above legacy content or use an overlay camera.
+            .add_systems(Core2d, vector_pass.in_set(Core2dSystems::Prepass));
     }
 }
 
@@ -346,11 +356,26 @@ fn canonical_arc_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
     const SEGMENTS: u32 = 64;
     let n = SEGMENTS;
     let mut vertices = Vec::with_capacity((4 * (n + 1) + 4) as usize);
-    // Interior: inner/outer pair per step, full coverage, no fringe.
+    // Interior: inner/outer pair per step at full coverage. These carry
+    // their outward directions (radial for the ring edges, tangential at
+    // the caps) so the vertex shader can inset them half a pixel — the AA
+    // band straddles the authored edge instead of hanging outside it.
     for i in 0..=n {
         let t = i as f32 / n as f32;
+        let tangential = if i == 0 {
+            -1.0
+        } else if i == n {
+            1.0
+        } else {
+            0.0
+        };
         for side in [0.0f32, 1.0] {
-            vertices.push(GpuVertex { position: [t, side], normal: [0.0, 0.0], coverage: 1.0 });
+            let radial = if side == 0.0 { -1.0 } else { 1.0 };
+            vertices.push(GpuVertex {
+                position: [t, side],
+                normal: [radial, tangential],
+                coverage: 1.0,
+            });
         }
     }
     // Fringe rings: outer edge displaces +radial, inner edge -radial.
@@ -364,12 +389,14 @@ fn canonical_arc_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
         let t = i as f32 / n as f32;
         vertices.push(GpuVertex { position: [t, 0.0], normal: [-1.0, 0.0], coverage: 0.0 });
     }
-    // End caps displace tangentially (backward at t=0, forward at t=1).
+    // End-cap corners displace tangentially (backward at t=0, forward at
+    // t=1) AND radially, so each is the outward twin of the interior corner
+    // vertex it pairs with.
     let caps = vertices.len() as u32;
-    vertices.push(GpuVertex { position: [0.0, 0.0], normal: [0.0, -1.0], coverage: 0.0 });
-    vertices.push(GpuVertex { position: [0.0, 1.0], normal: [0.0, -1.0], coverage: 0.0 });
-    vertices.push(GpuVertex { position: [1.0, 0.0], normal: [0.0, 1.0], coverage: 0.0 });
-    vertices.push(GpuVertex { position: [1.0, 1.0], normal: [0.0, 1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [0.0, 0.0], normal: [-1.0, -1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [0.0, 1.0], normal: [1.0, -1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [1.0, 0.0], normal: [-1.0, 1.0], coverage: 0.0 });
+    vertices.push(GpuVertex { position: [1.0, 1.0], normal: [1.0, 1.0], coverage: 0.0 });
 
     let (inner_at, outer_at) = (|i: u32| i * 2, |i: u32| i * 2 + 1);
     let mut indices = Vec::new();
@@ -1688,8 +1715,9 @@ fn prepare_view_bind_groups(
     }
 }
 
-/// The vector pass. Runs in the `Core2d` schedule after the main pass:
-/// opaque interiors first (depth write, no blend, early-z), then blend items
+/// The vector pass. Runs in the `Core2d` schedule before the main 2D pass
+/// (see plugin registration for the depth-interleaving rationale): opaque
+/// interiors first (depth write, no blend, early-z), then blend items
 /// back-to-front (translucent interiors + AA fringes, depth read-only).
 /// Two multi-draw calls total when the device supports indirect.
 fn vector_pass(

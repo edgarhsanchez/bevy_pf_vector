@@ -95,7 +95,12 @@ fn build_geometry(positions: Vec<[f32; 2]>, interior_indices: Vec<u32>) -> Tesse
         .map(|&position| TessVertex { position, normal: [0.0, 0.0], coverage: 1.0 })
         .collect();
 
-    // One displaced coverage-0 twin per boundary vertex.
+    // One coverage-0 twin per boundary vertex. Both the original and the
+    // twin carry the same outward normal: the vertex shader displaces by
+    // (0.5 - coverage) pixels along it, so the original moves half a pixel
+    // inward and the twin half a pixel outward — an AA band centered on the
+    // authored edge rather than a halo hung outside it. Interior vertices
+    // keep a zero normal and never move.
     let mut ring: HashMap<u32, u32> = HashMap::new();
     let mut fringe_indices = Vec::with_capacity(boundary.len() * 6);
     for (&index, normal) in &normals {
@@ -106,6 +111,7 @@ fn build_geometry(positions: Vec<[f32; 2]>, interior_indices: Vec<u32>) -> Tesse
             // Opposing edges cancelled (degenerate sliver) — no displacement.
             [0.0, 0.0]
         };
+        vertices[index as usize].normal = normal;
         let outer = vertices.len() as u32;
         vertices.push(TessVertex {
             position: positions[index as usize],
