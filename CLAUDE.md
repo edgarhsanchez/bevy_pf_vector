@@ -518,6 +518,53 @@ Before it returns, `shapes_gpu_check` must exercise shapes ACROSS FRAMES
 with resize and remount — screenshotting one settled frame is what let all
 of this through.
 
+## SDF PRIMITIVES — the design, read out of a working implementation
+
+Researched rather than invented, after the friginrain_hud port failed. The
+reference is `C:/github/bevy_vector_shapes/src/render/shaders/` (on disk),
+cross-checked against current sources: SDF is still the best practice for
+GPU UI in 2026, precisely because it needs no tessellation, no intersection
+maths and no CPU processing per size change.
+
+How bevy_vector_shapes actually does a rect (shapes/rect.wgsl):
+
+- ONE quad per instance. Never tessellates, for any shape, ever.
+- Instance data: 4x vec4 matrix, color, `thickness`, `flags`, `size: vec2`,
+  `corner_radii: vec4`. SIZE IS PER-INSTANCE — that is the whole trick, and
+  the thing our tessellate-once cache cannot do.
+- Vertex: scales the unit quad by `size`, plus `AA_PADDING = 2.0` so the
+  antialiased edge has room. Outputs uv scaled so the SHORTEST side is 1,
+  and caps corner radii at half the shortest side.
+- Fragment:
+      dist = rectSDF(uv, size - radii) - radii
+      in_shape *= step_aa(-thickness, dist) * step_aa(dist, 0.0)
+  where `rectSDF` is the standard
+      length(max(abs(p) - size, 0)) + min(0, max(to_corner.x, to_corner.y))
+  FILL AND STROKE ARE THE SAME SHADER: a band test on the distance. Filled
+  is just thickness = 1.0 in uv space.
+- Antialiasing is `step_aa`, which uses the SCREEN-SPACE DERIVATIVE of the
+  distance (`dpdx`/`dpdy` -> `length`) as the pixel footprint. That is why
+  it stays crisp at any scale with no geometry work — versus our fringe
+  approach, which bakes AA into extruded geometry and therefore has to
+  re-tessellate when size changes.
+- Fragments outside the shape `discard` before any texture sample.
+
+Mapping onto this engine: `VectorPrimitive::Arc` is ALREADY this pattern
+(vertex-shader geometry from per-instance params, zero tessellation), so
+the work is to add siblings, not a new subsystem:
+
+    VectorPrimitive::Rect   { size, corner_radii, thickness, color }
+    VectorPrimitive::Circle { radius, thickness, color }
+    VectorPrimitive::Line   { start, end, thickness, cap, color }
+
+with a quad mesh instead of the arc's (t, side) strip, and an SDF fragment
+shader. `thickness == 0` means filled. Once those exist, an immediate-mode
+HUD can animate size every frame at one instance write per shape, and
+`friginrain_hud` can move over for real.
+
+Do NOT re-attempt that port before these land — the failure was structural,
+not incidental.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
