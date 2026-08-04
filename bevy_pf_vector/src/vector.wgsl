@@ -31,6 +31,8 @@ struct ClipEntry {
 // Raw vec4 view: reading through the typed struct misreads on this naga
 // version, so entries are reconstructed from 3 vec4s per 48-byte entry.
 @group(0) @binding(1) var<storage, read> clips_raw: array<vec4<f32>>;
+@group(0) @binding(2) var gradient_tex: texture_2d<f32>;
+@group(0) @binding(3) var gradient_sampler: sampler;
 
 // Analytic nested clipping: multiply coverage by an antialiased
 // rounded-rect/circle SDF per chain entry. AA width is derived from the
@@ -73,6 +75,11 @@ struct VertexIn {
     @location(4) i_translation_z: vec4<f32>,
     // Unorm8x4 — hardware-expanded to 0..1 floats for free.
     @location(5) i_color: vec4<f32>,
+    // Gradient geometry in local space: linear = (start, end); radial =
+    // (center, radius, _).
+    @location(6) i_brush_params: vec4<f32>,
+    // atlas_row * 4 + kind (0 solid / 1 linear / 2 radial).
+    @location(7) i_brush_meta: f32,
 }
 
 struct VertexOut {
@@ -81,6 +88,9 @@ struct VertexOut {
     @location(1) coverage: f32,
     @location(2) world_xy: vec2<f32>,
     @location(3) clip_pack_f: f32,
+    @location(4) local_xy: vec2<f32>,
+    @location(5) brush_params: vec4<f32>,
+    @location(6) brush_meta: f32,
 }
 
 @vertex
@@ -112,10 +122,31 @@ fn vertex(in: VertexIn) -> VertexOut {
     out.coverage = in.coverage;
     out.world_xy = world_xy;
     out.clip_pack_f = in.i_translation_z.w;
+    out.local_xy = in.position;
+    out.brush_params = in.i_brush_params;
+    out.brush_meta = in.i_brush_meta;
     return out;
 }
 
 @fragment
 fn fragment(in: VertexOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color.rgb, in.color.a * in.coverage * clip_coverage(in.world_xy, u32(in.clip_pack_f + 0.5)));
+    var base = in.color;
+    let bmeta = u32(in.brush_meta + 0.5);
+    let kind = bmeta & 3u;
+    if (kind != 0u) {
+        var t = 0.0;
+        if (kind == 1u) {
+            let d = in.brush_params.zw - in.brush_params.xy;
+            t = dot(in.local_xy - in.brush_params.xy, d) / max(dot(d, d), 1.0e-6);
+        } else {
+            t = length(in.local_xy - in.brush_params.xy) / max(in.brush_params.z, 1.0e-6);
+        }
+        let row = f32(bmeta >> 2u);
+        let uv = vec2<f32>(
+            (clamp(t, 0.0, 1.0) * 255.0 + 0.5) / 256.0,
+            (row + 0.5) / 1024.0,
+        );
+        base = textureSampleLevel(gradient_tex, gradient_sampler, uv, 0.0) * in.color;
+    }
+    return vec4<f32>(base.rgb, base.a * in.coverage * clip_coverage(in.world_xy, u32(in.clip_pack_f + 0.5)));
 }

@@ -141,6 +141,24 @@ screenshot-driven shader bisection while building workload 3; with it fixed
 the engine pays its real AA cost — earlier GPU figures were ~30-45% lower
 but with broken edge AA. The tables above are the honest, corrected values.
 
+## Gradient results (multi-stop linear + radial fills, 24-gradient palette)
+
+| backend | 200 el GPU | 5000 el GPU |
+|---|---|---|
+| Vello 0.9 (Linebender, native gradients) | 0.943 ms | — |
+| **bevy_pf_vector (ours)** (`--gradients`) | **0.0174 ms** | **0.196 ms** |
+
+Brushes are now full-featured for fills AND strokes: `Brush::Solid`,
+`Brush::Linear`/`Brush::Radial` with arbitrary multi-stop lists. Each unique
+stop list bakes once into a 1024-row LUT atlas; a gradient then costs the
+same 56-byte instance write as a solid color and one texture sample per
+fragment — measurably ~free (5000-element gradient GPU time equals solid).
+Over-budget unique gradients degrade to solid rather than thrash. Also
+added: arbitrary WPF-style dash arrays with phase offset, `FillRule`
+(NonZero/EvenOdd), and stroke miter limits — the full feature set bevy_pf
+XAML shapes require. bevy_vector_shapes cannot run this workload (no
+gradients).
+
 ## Overlap stress (2000 shapes stacked ~15 deep in a central disc — p50)
 
 | backend | render GPU | fragment invocations |

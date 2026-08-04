@@ -86,8 +86,8 @@ fn setup_vello_target(
 }
 
 struct RetainedItem {
-    fill: Option<(BezPath, VelloColor)>,
-    stroke: Option<(Stroke, BezPath, VelloColor)>,
+    fill: Option<(BezPath, vello::peniko::Brush)>,
+    stroke: Option<(Stroke, BezPath, vello::peniko::Brush)>,
 }
 
 #[derive(Default, Resource)]
@@ -109,6 +109,31 @@ fn to_vello_color(color: LinearRgba) -> VelloColor {
         (srgba.blue.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
         (srgba.alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
     )
+}
+
+fn to_vello_brush(brush: &bevy_pf_vector::path::Brush) -> vello::peniko::Brush {
+    use bevy_pf_vector::path::Brush;
+    use vello::peniko::{ColorStop, Gradient};
+    let stops_of = |stops: &[bevy_pf_vector::path::GradientStop]| -> Vec<ColorStop> {
+        stops
+            .iter()
+            .map(|s| ColorStop::from((s.offset, to_vello_color(s.color))))
+            .collect::<Vec<_>>()
+    };
+    match brush {
+        Brush::Solid(c) => vello::peniko::Brush::Solid(to_vello_color(*c)),
+        Brush::Linear { start, end, stops } => vello::peniko::Brush::Gradient(
+            Gradient::new_linear(
+                (f64::from(start.x), f64::from(start.y)),
+                (f64::from(end.x), f64::from(end.y)),
+            )
+            .with_stops(stops_of(stops).as_slice()),
+        ),
+        Brush::Radial { center, radius, stops } => vello::peniko::Brush::Gradient(
+            Gradient::new_radial((f64::from(center.x), f64::from(center.y)), *radius)
+                .with_stops(stops_of(stops).as_slice()),
+        ),
+    }
 }
 
 fn to_bez_path(commands: &[PathCommand]) -> BezPath {
@@ -173,8 +198,9 @@ fn extract_vello_shapes(
             fill: shape
                 .style
                 .fill
-                .map(|color| (to_bez_path(&shape.commands), to_vello_color(color))),
-            stroke: shape.style.stroke.map(|stroke| {
+                .as_ref()
+                .map(|brush| (to_bez_path(&shape.commands), to_vello_brush(brush))),
+            stroke: shape.style.stroke.as_ref().map(|stroke| {
                 let cap = match stroke.cap {
                     bevy_pf_vector::LineCap::Butt => Cap::Butt,
                     bevy_pf_vector::LineCap::Round => Cap::Round,
@@ -187,14 +213,20 @@ fn extract_vello_shapes(
                 };
                 (
                     {
-                        let mut s = Stroke::new(f64::from(stroke.width)).with_caps(cap).with_join(join);
-                        if let Some([on, off]) = stroke.dash {
-                            s = s.with_dashes(0.0, [f64::from(on), f64::from(off)]);
+                        let mut s = Stroke::new(f64::from(stroke.width))
+                            .with_caps(cap)
+                            .with_join(join)
+                            .with_miter_limit(f64::from(stroke.miter_limit));
+                        if let Some(dash) = &stroke.dash {
+                            s = s.with_dashes(
+                                f64::from(dash.offset),
+                                dash.pattern.iter().map(|&v| f64::from(v)).collect::<Vec<_>>(),
+                            );
                         }
                         s
                     },
                     to_bez_path(&shape.commands),
-                    to_vello_color(stroke.color),
+                    to_vello_brush(&stroke.brush),
                 )
             }),
         });
@@ -315,11 +347,11 @@ fn vello_pass(
         }
 
         let transform = flip * Affine::new(*affine);
-        if let Some((path, color)) = &item.fill {
-            ctx.scene.fill(Fill::NonZero, transform, *color, None, path);
+        if let Some((path, brush)) = &item.fill {
+            ctx.scene.fill(Fill::NonZero, transform, brush, None, path);
         }
-        if let Some((stroke, path, color)) = &item.stroke {
-            ctx.scene.stroke(stroke, transform, *color, None, path);
+        if let Some((stroke, path, brush)) = &item.stroke {
+            ctx.scene.stroke(stroke, transform, brush, None, path);
         }
     }
     for _ in 0..stack.len() {

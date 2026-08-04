@@ -10,7 +10,7 @@ use lyon::tessellation::{
     LineJoin as LyonJoin, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers,
 };
 
-use crate::path::{LineCap, LineJoin, PathCommand, StrokeStyle};
+use crate::path::{FillRule, LineCap, LineJoin, PathCommand, StrokeStyle};
 
 /// Max distance in local units between a curve and its flattened form.
 /// Shapes are authored in pixel-scale units, so this is ~1/4 px.
@@ -169,13 +169,20 @@ fn build_path(commands: &[PathCommand]) -> Path {
     builder.build()
 }
 
-pub fn tessellate_fill(commands: &[PathCommand]) -> Option<TessellatedGeometry> {
+pub fn tessellate_fill(
+    commands: &[PathCommand],
+    rule: FillRule,
+) -> Option<TessellatedGeometry> {
+    let lyon_rule = match rule {
+        FillRule::NonZero => lyon::tessellation::FillRule::NonZero,
+        FillRule::EvenOdd => lyon::tessellation::FillRule::EvenOdd,
+    };
     let path = build_path(commands);
     let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
     FillTessellator::new()
         .tessellate_path(
             &path,
-            &FillOptions::tolerance(TOLERANCE),
+            &FillOptions::tolerance(TOLERANCE).with_fill_rule(lyon_rule),
             &mut BuffersBuilder::new(&mut buffers, |v: FillVertex| v.position().to_array()),
         )
         .ok()?;
@@ -188,7 +195,7 @@ pub fn tessellate_stroke(
 ) -> Option<TessellatedGeometry> {
     // Dashed strokes: expand to a fill outline with kurbo (handles dashing,
     // joins, caps), then fill-tessellate the outline. Still once per shape.
-    if let Some([on, off]) = stroke.dash {
+    if let Some(dash) = &stroke.dash {
         use kurbo::{PathEl, Point};
         let p = |v: bevy::math::Vec2| Point::new(f64::from(v.x), f64::from(v.y));
         let els: Vec<PathEl> = commands
@@ -216,7 +223,11 @@ pub fn tessellate_stroke(
         let style = kurbo::Stroke::new(f64::from(stroke.width))
             .with_caps(cap)
             .with_join(join)
-            .with_dashes(0.0, [f64::from(on.max(0.01)), f64::from(off.max(0.01))]);
+            .with_miter_limit(f64::from(stroke.miter_limit))
+            .with_dashes(
+                f64::from(dash.offset),
+                dash.pattern.iter().map(|&v| f64::from(v.max(0.01))).collect::<Vec<_>>(),
+            );
         let outline = kurbo::stroke(
             els,
             &style,
@@ -287,6 +298,7 @@ pub fn tessellate_stroke(
     };
     let options = StrokeOptions::tolerance(TOLERANCE)
         .with_line_width(stroke.width)
+        .with_miter_limit(stroke.miter_limit)
         .with_start_cap(cap)
         .with_end_cap(cap)
         .with_line_join(join);
@@ -310,9 +322,10 @@ pub(crate) fn fast_hasher() -> impl Hasher {
 
 /// Content hash identifying a fill geometry. Instances of identical paths
 /// share GPU geometry and draw instanced.
-pub fn fill_key(commands: &[PathCommand]) -> u64 {
+pub fn fill_key(commands: &[PathCommand], rule: FillRule) -> u64 {
     let mut hasher = fast_hasher();
     0u8.hash(&mut hasher);
+    (rule as u8).hash(&mut hasher);
     hash_commands(commands, &mut hasher);
     hasher.finish()
 }
@@ -325,9 +338,12 @@ pub fn stroke_key(commands: &[PathCommand], stroke: &StrokeStyle) -> u64 {
     stroke.width.to_bits().hash(&mut hasher);
     (stroke.join as u8).hash(&mut hasher);
     (stroke.cap as u8).hash(&mut hasher);
-    if let Some([on, off]) = stroke.dash {
-        on.to_bits().hash(&mut hasher);
-        off.to_bits().hash(&mut hasher);
+    stroke.miter_limit.to_bits().hash(&mut hasher);
+    if let Some(dash) = &stroke.dash {
+        dash.offset.to_bits().hash(&mut hasher);
+        for value in &dash.pattern {
+            value.to_bits().hash(&mut hasher);
+        }
     }
     hash_commands(commands, &mut hasher);
     hasher.finish()

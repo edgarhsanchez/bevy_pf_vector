@@ -76,6 +76,7 @@ impl Plugin for VectorRenderPlugin {
             .init_resource::<ExtractedShapes>()
             .init_resource::<ExtractedParametrics>()
             .init_resource::<ExtractedClips>()
+            .init_resource::<GradientAtlas>()
             .init_resource::<VectorBuffers>()
             .init_resource::<VectorViewBindGroups>()
             .init_resource::<VectorPipeline>()
@@ -90,6 +91,7 @@ impl Plugin for VectorRenderPlugin {
                     prepare_vector_buffers.in_set(RenderSystems::PrepareResources),
                     prepare_parametrics.in_set(RenderSystems::PrepareResources),
                     prepare_clips.in_set(RenderSystems::PrepareResources),
+                    prepare_gradients.in_set(RenderSystems::PrepareResources),
                     prepare_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                 ),
             )
@@ -109,13 +111,17 @@ struct GpuVertex {
     coverage: f32,
 }
 
-/// 36 bytes. Columns of the 2x2 linear part, translation + z, RGBA8 color.
+/// 56 bytes: 2x2 linear part, translation + z + clip pack, RGBA8 tint,
+/// brush params (gradient geometry in local space), packed brush meta
+/// (atlas_row * 4 + kind; kind 0 solid / 1 linear / 2 radial).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuInstance {
     linear: [f32; 4],
     translation_z: [f32; 4],
     color: [u8; 4],
+    brush_params: [f32; 4],
+    brush_meta: f32,
 }
 
 /// One analytic clip entry: inverse world transform of the clip entity plus
@@ -145,6 +151,122 @@ fn pack_clip(start: u32, count: u32) -> f32 {
 pub struct ExtractedClips {
     entries: Vec<GpuClip>,
     chains: HashMap<Entity, (u32, u32)>,
+}
+
+/// Gradient lookup atlas: each unique stop list bakes once into a 256-texel
+/// sRGB row; instances reference rows by index. 256 rows; epoch-flushed if
+/// content churn ever fills it.
+pub const GRADIENT_ATLAS_SIZE: u32 = 256;
+/// Number of gradient rows in the atlas.
+pub const GRADIENT_ATLAS_ROWS: u32 = 1024;
+
+#[derive(Resource, Default)]
+pub struct GradientAtlas {
+    rows: HashMap<u64, u32>,
+    next_row: u32,
+    /// Baked rows not yet uploaded: (row, 256 RGBA8 texels).
+    pending: Vec<(u32, Vec<u8>)>,
+}
+
+impl GradientAtlas {
+    /// Returns the atlas row for a stop list, baking it on first sight.
+    fn ensure_row(&mut self, stops: &[crate::path::GradientStop]) -> Option<u32> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = tess::fast_hasher();
+        for stop in stops {
+            stop.offset.to_bits().hash(&mut hasher);
+            stop.color.red.to_bits().hash(&mut hasher);
+            stop.color.green.to_bits().hash(&mut hasher);
+            stop.color.blue.to_bits().hash(&mut hasher);
+            stop.color.alpha.to_bits().hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        if let Some(&row) = self.rows.get(&key) {
+            return Some(row);
+        }
+        if self.next_row >= GRADIENT_ATLAS_ROWS {
+            // Full: degrade to solid rather than thrash. Real content reuses
+            // gradients; 1024 unique simultaneous gradients is the budget.
+            return None;
+        }
+        let row = self.next_row;
+        self.next_row += 1;
+        self.rows.insert(key, row);
+
+        let mut sorted: Vec<_> = stops.to_vec();
+        sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+        let mut texels = Vec::with_capacity(GRADIENT_ATLAS_SIZE as usize * 4);
+        for i in 0..GRADIENT_ATLAS_SIZE {
+            let t = i as f32 / (GRADIENT_ATLAS_SIZE - 1) as f32;
+            let color = sample_stops(&sorted, t);
+            let srgba: Srgba = color.into();
+            texels.push((srgba.red.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+            texels.push((srgba.green.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+            texels.push((srgba.blue.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+            texels.push((srgba.alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+        }
+        self.pending.push((row, texels));
+        Some(row)
+    }
+}
+
+fn sample_stops(sorted: &[crate::path::GradientStop], t: f32) -> LinearRgba {
+    match sorted {
+        [] => LinearRgba::WHITE,
+        [only] => only.color,
+        _ => {
+            if t <= sorted[0].offset {
+                return sorted[0].color;
+            }
+            for pair in sorted.windows(2) {
+                if t <= pair[1].offset {
+                    let span = (pair[1].offset - pair[0].offset).max(1.0e-6);
+                    let k = (t - pair[0].offset) / span;
+                    return LinearRgba {
+                        red: pair[0].color.red + (pair[1].color.red - pair[0].color.red) * k,
+                        green: pair[0].color.green
+                            + (pair[1].color.green - pair[0].color.green) * k,
+                        blue: pair[0].color.blue + (pair[1].color.blue - pair[0].color.blue) * k,
+                        alpha: pair[0].color.alpha
+                            + (pair[1].color.alpha - pair[0].color.alpha) * k,
+                    };
+                }
+            }
+            sorted.last().unwrap().color
+        }
+    }
+}
+
+/// Resolves a brush into (tint, gradient params, packed meta) instance data.
+fn resolve_brush(brush: &crate::path::Brush, atlas: &mut GradientAtlas) -> ([u8; 4], [f32; 4], f32) {
+    use crate::path::Brush;
+    match brush {
+        Brush::Solid(color) => (pack_color(*color), [0.0; 4], 0.0),
+        Brush::Linear { start, end, stops } => match atlas.ensure_row(stops) {
+            Some(row) => (
+                [255; 4],
+                [start.x, start.y, end.x, end.y],
+                (row * 4 + 1) as f32,
+            ),
+            None => (
+                pack_color(stops.first().map(|s| s.color).unwrap_or(LinearRgba::WHITE)),
+                [0.0; 4],
+                0.0,
+            ),
+        },
+        Brush::Radial { center, radius, stops } => match atlas.ensure_row(stops) {
+            Some(row) => (
+                [255; 4],
+                [center.x, center.y, *radius, 0.0],
+                (row * 4 + 2) as f32,
+            ),
+            None => (
+                pack_color(stops.first().map(|s| s.color).unwrap_or(LinearRgba::WHITE)),
+                [0.0; 4],
+                0.0,
+            ),
+        },
+    }
 }
 
 /// 52 bytes: the tessellated-instance fields plus the primitive parameters
@@ -285,6 +407,8 @@ fn instance_buffer_layout() -> VertexBufferLayout {
             VertexFormat::Float32x4,
             VertexFormat::Float32x4,
             VertexFormat::Unorm8x4,
+            VertexFormat::Float32x4,
+            VertexFormat::Float32,
         ],
     );
     // from_vertex_formats numbers locations from 0; instance attributes
@@ -359,6 +483,8 @@ struct ExtractedInstance {
     linear: [f32; 4],
     translation: [f32; 2],
     color: [u8; 4],
+    brush_params: [f32; 4],
+    brush_meta: f32,
     opaque: bool,
     clip: f32,
 }
@@ -452,6 +578,10 @@ pub struct VectorBuffers {
     /// Fixed-capacity analytic clip storage (created once; bind groups stay
     /// stable), rewritten per frame.
     clip: Option<Buffer>,
+    /// Gradient LUT atlas (created once), plus its view and sampler.
+    gradient_texture: Option<bevy::render::render_resource::Texture>,
+    gradient_view: Option<bevy::render::render_resource::TextureView>,
+    gradient_sampler: Option<bevy::render::render_resource::Sampler>,
 }
 
 #[derive(Default)]
@@ -488,6 +618,8 @@ impl Default for VectorPipeline {
                     (
                         (0, uniform_buffer::<VectorViewUniform>(false)),
                         (1, bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(false, None)),
+                        (2, bevy::render::render_resource::binding_types::texture_2d(bevy::render::render_resource::TextureSampleType::Float { filterable: true })),
+                        (3, bevy::render::render_resource::binding_types::sampler(bevy::render::render_resource::SamplerBindingType::Filtering)),
                     ),
                 ),
             ),
@@ -652,6 +784,7 @@ fn extract_shapes(
     clips: Res<ExtractedClips>,
     mut cache: ResMut<GeometryCache>,
     mut extracted: ResMut<ExtractedShapes>,
+    mut atlas: ResMut<GradientAtlas>,
 ) {
     extracted.items.clear();
     extracted.dynamic_vertices.clear();
@@ -675,6 +808,7 @@ fn extract_shapes(
         push_shape(
             &mut cache,
             &mut extracted,
+            &mut atlas,
             &clips,
             &shape,
             linear,
@@ -685,7 +819,7 @@ fn extract_shapes(
     }
     for (shape, hud, clipped) in &flat_shapes {
         let (linear, translation, z) = hud.decompose();
-        push_shape(&mut cache, &mut extracted, &clips, &shape, linear, translation, z, clipped);
+        push_shape(&mut cache, &mut extracted, &mut atlas, &clips, &shape, linear, translation, z, clipped);
     }
 }
 
@@ -693,6 +827,7 @@ fn extract_shapes(
 fn push_shape(
     cache: &mut GeometryCache,
     extracted: &mut ExtractedShapes,
+    atlas: &mut GradientAtlas,
     clips: &ExtractedClips,
     shape: &Ref<VectorShape>,
     linear: [f32; 4],
@@ -708,47 +843,54 @@ fn push_shape(
         // `is_changed` is true on the frame a path/style mutates (and on
         // spawn); those shapes skip the cache entirely this frame.
         let dynamic = shape.is_changed();
-        if let Some(color) = shape.style.fill {
+        if let Some(brush) = &shape.style.fill {
+            let rule = shape.style.fill_rule;
             let geometry = if dynamic {
-                tess::tessellate_fill(&shape.commands)
+                tess::tessellate_fill(&shape.commands, rule)
                     .map(|g| GeometryRef::Dynamic(extracted.append_dynamic(g)))
             } else {
-                let key = tess::fill_key(&shape.commands);
-                cache.ensure(key, || tess::tessellate_fill(&shape.commands));
+                let key = tess::fill_key(&shape.commands, rule);
+                cache.ensure(key, || tess::tessellate_fill(&shape.commands, rule));
                 Some(GeometryRef::Cached(key))
             };
             if let Some(geometry) = geometry {
+                let (color, brush_params, brush_meta) = resolve_brush(brush, atlas);
                 extracted.items.push(ExtractedInstance {
                     geometry,
                     z,
                     linear,
                     translation,
-                    color: pack_color(color),
+                    color,
+                    brush_params,
+                    brush_meta,
                     // Clipped instances need blending (both for the alpha
                     // knock-out and for AA clip edges).
-                    opaque: color.alpha >= 1.0 && clip == 0.0,
+                    opaque: brush.is_opaque() && clip == 0.0,
                     clip,
                 });
             }
         }
-        if let Some(stroke) = shape.style.stroke {
+        if let Some(stroke) = &shape.style.stroke {
             let geometry = if dynamic {
-                tess::tessellate_stroke(&shape.commands, &stroke)
+                tess::tessellate_stroke(&shape.commands, stroke)
                     .map(|g| GeometryRef::Dynamic(extracted.append_dynamic(g)))
             } else {
-                let key = tess::stroke_key(&shape.commands, &stroke);
-                cache.ensure(key, || tess::tessellate_stroke(&shape.commands, &stroke));
+                let key = tess::stroke_key(&shape.commands, stroke);
+                cache.ensure(key, || tess::tessellate_stroke(&shape.commands, stroke));
                 Some(GeometryRef::Cached(key))
             };
             if let Some(geometry) = geometry {
+                let (color, brush_params, brush_meta) = resolve_brush(&stroke.brush, atlas);
                 extracted.items.push(ExtractedInstance {
                     geometry,
                     // Strokes draw over their own fill at equal z.
                     z: z + 1.0e-4,
                     linear,
                     translation,
-                    color: pack_color(stroke.color),
-                    opaque: stroke.color.alpha >= 1.0 && clip == 0.0,
+                    color,
+                    brush_params,
+                    brush_meta,
+                    opaque: stroke.brush.is_opaque() && clip == 0.0,
                     clip,
                 });
             }
@@ -1038,6 +1180,8 @@ fn prepare_vector_buffers(
         linear: item.linear,
         translation_z: [item.translation[0], item.translation[1], item.z, item.clip],
         color: item.color,
+        brush_params: item.brush_params,
+        brush_meta: item.brush_meta,
     };
 
     if fingerprint == buffers.layout_fingerprint && !buffers.permutation.is_empty() {
@@ -1298,6 +1442,64 @@ fn prepare_clips(
     }
 }
 
+/// Creates the gradient atlas once and uploads any newly-baked rows.
+fn prepare_gradients(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut atlas: ResMut<GradientAtlas>,
+    mut buffers: ResMut<VectorBuffers>,
+) {
+    use bevy::render::render_resource::{
+        AddressMode, Extent3d, FilterMode, Origin3d, SamplerDescriptor, TexelCopyBufferLayout,
+        TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureUsages,
+    };
+    if buffers.gradient_texture.is_none() {
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("pf_vector_gradients"),
+            size: Extent3d {
+                width: GRADIENT_ATLAS_SIZE,
+                height: GRADIENT_ATLAS_ROWS,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        buffers.gradient_view = Some(texture.create_view(&Default::default()));
+        buffers.gradient_texture = Some(texture);
+        buffers.gradient_sampler = Some(device.create_sampler(&SamplerDescriptor {
+            label: Some("pf_vector_gradient_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        }));
+    }
+    if let Some(texture) = &buffers.gradient_texture {
+        for (row, texels) in atlas.pending.drain(..) {
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: Origin3d { x: 0, y: row, z: 0 },
+                    aspect: TextureAspect::All,
+                },
+                &texels,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(GRADIENT_ATLAS_SIZE * 4),
+                    rows_per_image: None,
+                },
+                Extent3d { width: GRADIENT_ATLAS_SIZE, height: 1, depth_or_array_layers: 1 },
+            );
+        }
+    }
+}
+
 fn prepare_view_bind_groups(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -1306,7 +1508,9 @@ fn prepare_view_bind_groups(
     views: Query<(Entity, &ExtractedView)>,
     mut bind_groups: ResMut<VectorViewBindGroups>,
 ) {
-    let Some(clip_buffer) = &buffers.clip else {
+    let (Some(clip_buffer), Some(gradient_view), Some(gradient_sampler)) =
+        (&buffers.clip, &buffers.gradient_view, &buffers.gradient_sampler)
+    else {
         return;
     };
     for (entity, view) in &views {
@@ -1326,6 +1530,8 @@ fn prepare_view_bind_groups(
                 &BindGroupEntries::with_indices((
                     (0, entry.uniform.binding().unwrap()),
                     (1, clip_buffer.as_entire_binding()),
+                    (2, gradient_view),
+                    (3, gradient_sampler),
                 )),
             ));
         }

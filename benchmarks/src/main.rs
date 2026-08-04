@@ -65,6 +65,8 @@ struct BenchConfig {
     strokes: u32,
     /// Engine only: animate via flat HudTransform (no hierarchy propagation).
     flat: bool,
+    /// Fill shapes with multi-stop linear/radial gradients.
+    gradients: bool,
     warmup: u32,
     frames: u32,
     out_dir: PathBuf,
@@ -85,6 +87,7 @@ fn parse_args() -> BenchConfig {
     let mut overlap = false;
     let mut strokes = 0u32;
     let mut flat = false;
+    let mut gradients = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -112,6 +115,7 @@ fn parse_args() -> BenchConfig {
             "--screenshot" => screenshot = true,
             "--overlap" => overlap = true,
             "--flat" => flat = true,
+            "--gradients" => gradients = true,
             "--strokes" => strokes = value().parse().expect("--strokes"),
             other => panic!("unknown argument '{other}'"),
         }
@@ -122,6 +126,8 @@ fn parse_args() -> BenchConfig {
             format!("{}_{}strk_{}f", backend.name(), strokes, frames)
         } else if flat {
             format!("{}_{}el_flat_{}f", backend.name(), elements, frames)
+        } else if gradients {
+            format!("{}_{}el_grad_{}f", backend.name(), elements, frames)
         } else if overlap {
             format!("{}_{}el_ovl_{}f", backend.name(), elements, frames)
         } else if clips > 0 {
@@ -132,7 +138,7 @@ fn parse_args() -> BenchConfig {
             format!("{}_{}el_{}f", backend.name(), elements, frames)
         }
     });
-    BenchConfig { backend, elements, dynamic, clips, overlap, strokes, flat, warmup, frames, out_dir, label, screenshot }
+    BenchConfig { backend, elements, dynamic, clips, overlap, strokes, flat, gradients, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -419,7 +425,8 @@ fn setup_stroke_workload(mut commands: Commands, cfg: Res<BenchConfig>) {
             1 => LineCap::Round,
             _ => LineCap::Square,
         };
-        let dash = (i % 2 == 0).then_some([width * 2.4, width * 1.6]);
+        let dash = (i % 2 == 0)
+            .then(|| bevy_pf_vector::path::DashPattern::new(vec![width * 2.4, width * 1.6]));
         let commands_path = if i % 5 == 4 {
             // Stroked (often dashed) circle — tick-ring look.
             circle_path(size)
@@ -444,10 +451,14 @@ fn setup_stroke_workload(mut commands: Commands, cfg: Res<BenchConfig>) {
         commands.spawn((
             VectorShape {
                 commands: commands_path,
-                style: PathStyle {
-                    fill: None,
-                    stroke: Some(StrokeStyle { color, width, join, cap, dash }),
-                },
+                style: PathStyle::stroke(StrokeStyle {
+                    brush: color.into(),
+                    width,
+                    join,
+                    cap,
+                    miter_limit: 4.0,
+                    dash,
+                }),
             },
             transform,
             anim,
@@ -556,15 +567,15 @@ fn setup_sprites(mut commands: Commands, cfg: Res<BenchConfig>) {
 /// exactly the same order as `setup_shapes`, so layout, sizes, colors, and
 /// kinds are identical to the control — sizes are baked into path
 /// coordinates instead of transform scale so tessellation density is right.
-fn fill(color: LinearRgba) -> bevy_pf_vector::PathStyle {
-    bevy_pf_vector::PathStyle { fill: Some(color), stroke: None }
+fn fill(brush: impl Into<bevy_pf_vector::path::Brush>) -> bevy_pf_vector::PathStyle {
+    bevy_pf_vector::PathStyle::fill(brush)
 }
 fn stroke(color: LinearRgba, width: f32) -> bevy_pf_vector::PathStyle {
     use bevy_pf_vector::{LineCap, LineJoin, StrokeStyle};
-    bevy_pf_vector::PathStyle {
-        fill: None,
-        stroke: Some(StrokeStyle { color, width, join: LineJoin::Round, cap: LineCap::Round, dash: None }),
-    }
+    let mut style = StrokeStyle::new(color, width);
+    style.join = LineJoin::Round;
+    style.cap = LineCap::Round;
+    bevy_pf_vector::PathStyle::stroke(style)
 }
 mod paths {
     use super::*;
@@ -652,6 +663,30 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
     for i in 0..cfg.elements {
         let (pos, size) = layout(i, cfg.elements, &mut rng, cfg.overlap);
         let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize].to_linear();
+        // Gradient paint when requested: pick from a reusable 24-entry
+        // gradient palette (real UIs share gradients; per-shape-unique
+        // gradients at scale would be an atlas-budget pathology, and the
+        // engine degrades those to solid rather than thrash).
+        let paint: bevy_pf_vector::path::Brush = if cfg.gradients {
+            use bevy_pf_vector::path::{Brush, GradientStop};
+            let g = rng.pick(24);
+            let mut grng = Rng(0x6AD_0000 + u64::from(g));
+            let c0 = HUD_PALETTE[grng.pick(6) as usize].to_linear();
+            let mid = HUD_PALETTE[grng.pick(6) as usize].to_linear();
+            let last = HUD_PALETTE[grng.pick(6) as usize].to_linear();
+            let stops = vec![
+                GradientStop { offset: 0.0, color: c0 },
+                GradientStop { offset: grng.range(0.3, 0.7), color: mid },
+                GradientStop { offset: 1.0, color: last },
+            ];
+            if g % 2 == 0 {
+                Brush::Linear { start: Vec2::splat(-size), end: Vec2::splat(size), stops }
+            } else {
+                Brush::Radial { center: Vec2::ZERO, radius: size * 1.2, stops }
+            }
+        } else {
+            color.into()
+        };
         // Same rng draws as the control; scale stays 1.0 — size is in the path.
         let (transform, anim) = animated(pos, 1.0, &mut rng);
 
@@ -687,7 +722,7 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
                     let thickness = rng.range(0.1, 0.3) * size;
                     VectorShape { commands: circle_path(size), style: stroke(color, thickness) }
                 } else {
-                    VectorShape { commands: circle_path(size), style: fill(color) }
+                    VectorShape { commands: circle_path(size), style: fill(paint.clone()) }
                 }
             }
             40..65 => {
@@ -698,7 +733,7 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
                 let path = rounded_rect_path(2.0 * aspect * size, 2.0 * size, corner);
                 match thickness {
                     Some(thickness) => VectorShape { commands: path, style: stroke(color, thickness) },
-                    None => VectorShape { commands: path, style: fill(color) },
+                    None => VectorShape { commands: path, style: fill(paint.clone()) },
                 }
             }
             65..80 => {
@@ -707,7 +742,7 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
                 let path = ngon_path(sides, size);
                 match thickness {
                     Some(thickness) => VectorShape { commands: path, style: stroke(color, thickness) },
-                    None => VectorShape { commands: path, style: fill(color) },
+                    None => VectorShape { commands: path, style: fill(paint.clone()) },
                 }
             }
             _ => {
@@ -956,7 +991,7 @@ fn finish(cfg: &BenchConfig, state: &BenchState, adapter: &str) {
 
 fn main() {
     let cfg = parse_args();
-    if (cfg.clips > 0 || cfg.strokes > 0) && !matches!(cfg.backend, Backend::Engine | Backend::Vello) {
+    if (cfg.clips > 0 || cfg.strokes > 0 || cfg.gradients) && !matches!(cfg.backend, Backend::Engine | Backend::Vello) {
         panic!(
             "workloads 3/4 (--clips/--strokes) require --backend engine|vello: '{}' lacks the features",
             cfg.backend.name()
