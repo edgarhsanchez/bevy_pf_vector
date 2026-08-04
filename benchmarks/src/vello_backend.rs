@@ -124,11 +124,16 @@ fn to_bez_path(commands: &[PathCommand]) -> BezPath {
 }
 
 fn extract_vello_shapes(
-    shapes: Extract<Query<(Entity, &VectorShape, &GlobalTransform)>>,
+    shapes: Extract<Query<(Entity, Ref<VectorShape>, &GlobalTransform)>>,
     mut workload: ResMut<VelloWorkload>,
 ) {
     workload.frame.clear();
     for (entity, shape, transform) in &shapes {
+        // Dynamic shapes (workload 2) rebuild their retained path — the CPU
+        // cost a real vello app pays when content mutates.
+        if shape.is_changed() {
+            workload.retained.remove(&entity);
+        }
         workload.retained.entry(entity).or_insert_with(|| RetainedItem {
             fill: shape
                 .style

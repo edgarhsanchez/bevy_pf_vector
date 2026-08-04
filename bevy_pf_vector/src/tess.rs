@@ -43,7 +43,8 @@ pub struct TessellatedGeometry {
 /// accumulates per-vertex outward normals, then emits a ring of coverage-0
 /// vertices and two triangles per boundary edge.
 fn build_geometry(positions: Vec<[f32; 2]>, interior_indices: Vec<u32>) -> TessellatedGeometry {
-    use std::collections::HashMap;
+    // foldhash, not SipHash — this runs for every tessellation.
+    use bevy::platform::collections::HashMap;
 
     let mut boundary: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
     for triangle in interior_indices.chunks_exact(3) {
@@ -212,10 +213,17 @@ pub fn tessellate_stroke(
     (!buffers.indices.is_empty()).then(|| build_geometry(buffers.vertices, buffers.indices))
 }
 
+/// foldhash — these keys are computed per shape per frame; SipHash is
+/// measurably wasteful here.
+pub(crate) fn fast_hasher() -> impl Hasher {
+    use std::hash::BuildHasher;
+    bevy::platform::hash::FixedState::default().build_hasher()
+}
+
 /// Content hash identifying a fill geometry. Instances of identical paths
 /// share GPU geometry and draw instanced.
 pub fn fill_key(commands: &[PathCommand]) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
+    let mut hasher = fast_hasher();
     0u8.hash(&mut hasher);
     hash_commands(commands, &mut hasher);
     hasher.finish()
@@ -224,7 +232,7 @@ pub fn fill_key(commands: &[PathCommand]) -> u64 {
 /// Content hash for a stroke geometry — width/join/cap change the mesh, so
 /// they are part of the key.
 pub fn stroke_key(commands: &[PathCommand], stroke: &StrokeStyle) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
+    let mut hasher = fast_hasher();
     1u8.hash(&mut hasher);
     stroke.width.to_bits().hash(&mut hasher);
     (stroke.join as u8).hash(&mut hasher);

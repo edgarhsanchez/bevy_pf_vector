@@ -73,10 +73,10 @@ renderer cost:
 | engine renderer cost (GPU pass + record + prepare) | ~0.015 ms | ~0.19 ms |
 
 Renderer-for-renderer the engine is roughly an order of magnitude faster at
-both scales, and our entire Bevy frame at 5000 elements (1.45 ms, ECS and
-all — after layout-fingerprint caching made prepare a pure gather and the
+both scales, and our entire Bevy frame at 5000 elements (1.16 ms, ECS and
+all — after layout-fingerprint caching, foldhash keys made prepare a pure gather and the
 benchmark client's animation went parallel; control measured with the same
-client at 3.31 ms) beats rive's render-only loop (1.72 ms). The dominant
+client at 3.31 ms) clearly beats rive's render-only loop (1.72 ms). The dominant
 remaining frame cost is Bevy's transform propagation, not the renderer —
 the next lever is an opt-in flat HUD transform path that bypasses the
 hierarchy, plus change-detection extraction for mostly-static HUDs. Rive pays per-frame path
@@ -92,10 +92,30 @@ cost a general-purpose renderer pays regardless of content, and exactly what
 the tessellate-once design avoids. This is not a knock on vello: it handles
 arbitrary dynamic scenes this engine deliberately does not.
 
-Not yet measured: the native Rive Renderer (rive-bevy pins an older Bevy and
-renders through vello anyway, so its numbers would approximate vello's; the
-native renderer would need a standalone harness), Skia, Pathfinder
-(different stacks, standalone harnesses), and workloads 2-4.
+## Workload 2 results (animated parameters: 200 elements, 50 arcs whose
+## sweep rewrites their path every frame — p50 over 600 frames)
+
+| backend | frame | render GPU |
+|---|---|---|
+| shapes (SDF control) | **0.99 ms** | 0.0215 ms |
+| vello 0.9 | 1.19 ms | 0.854 ms |
+| engine (`--dynamic 50`) | 1.52 ms | **0.0092 ms** |
+
+Honest reading: the engine now *supports* per-frame topology change (shapes
+whose `VectorShape` mutates tessellate into a transient buffer region;
+unchanged shapes stay on the tessellate-once path; stable-size dynamic
+shapes even keep the prepare fast path) — and its GPU time stays 2.3x ahead
+of the control. But the control wins workload-2 *frame* time: parametric
+SDF arcs are bevy_vector_shapes' native primitive, costing it zero geometry
+work, while we pay ~1 ms CPU re-tessellating 50 arcs per frame. The
+recorded fix (next milestone): parametric instanced primitives — a
+canonical (t, side) strip whose vertex shader computes ring-segment
+positions from per-instance start/sweep/radii, making parameter animation
+free for the common gauge/bar/arc cases while arbitrary paths keep the
+tessellation path.
+
+Not yet measured: Skia, Pathfinder (different stacks, standalone
+harnesses), rive native on workload 2, and workloads 3-4.
 
 The engine wins by structure, not tuning:
 

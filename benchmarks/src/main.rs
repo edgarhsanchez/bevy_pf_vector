@@ -54,6 +54,9 @@ impl Backend {
 struct BenchConfig {
     backend: Backend,
     elements: u32,
+    /// Workload 2: the first N elements are gauge arcs whose sweep angle
+    /// rewrites their path every frame (topology churn).
+    dynamic: u32,
     warmup: u32,
     frames: u32,
     out_dir: PathBuf,
@@ -64,6 +67,7 @@ struct BenchConfig {
 fn parse_args() -> BenchConfig {
     let mut backend = Backend::Shapes;
     let mut elements = 200u32;
+    let mut dynamic = 0u32;
     let mut warmup = 120u32;
     let mut frames = 600u32;
     let mut out_dir = PathBuf::from("benchmarks/results");
@@ -87,6 +91,7 @@ fn parse_args() -> BenchConfig {
                 }
             }
             "--elements" => elements = value().parse().expect("--elements"),
+            "--dynamic" => dynamic = value().parse().expect("--dynamic"),
             "--warmup" => warmup = value().parse().expect("--warmup"),
             "--frames" => frames = value().parse().expect("--frames"),
             "--out" => out_dir = PathBuf::from(value()),
@@ -96,9 +101,14 @@ fn parse_args() -> BenchConfig {
         }
     }
 
-    let label =
-        label.unwrap_or_else(|| format!("{}_{}el_{}f", backend.name(), elements, frames));
-    BenchConfig { backend, elements, warmup, frames, out_dir, label, screenshot }
+    let label = label.unwrap_or_else(|| {
+        if dynamic > 0 {
+            format!("{}_{}el_{}dyn_{}f", backend.name(), elements, dynamic, frames)
+        } else {
+            format!("{}_{}el_{}f", backend.name(), elements, frames)
+        }
+    });
+    BenchConfig { backend, elements, dynamic, warmup, frames, out_dir, label, screenshot }
 }
 
 // ---------------------------------------------------------------- rng
@@ -144,6 +154,67 @@ struct Animated {
 /// Frame index drives animation instead of wall time so runs are reproducible.
 #[derive(Resource, Default)]
 struct FrameCount(u32);
+
+/// Workload-2 marker: a gauge arc whose sweep rewrites its geometry each
+/// frame. Phase/speed come from the sibling `Animated` component.
+#[derive(Component)]
+struct DynamicArc {
+    outer: f32,
+    inner: f32,
+}
+
+/// Closed ring segment (outer arc, then inner arc reversed), y-up local.
+fn ring_segment_path(
+    outer: f32,
+    inner: f32,
+    start: f32,
+    end: f32,
+    segments: u32,
+) -> Vec<bevy_pf_vector::PathCommand> {
+    use bevy_pf_vector::PathCommand;
+    let mut commands = Vec::with_capacity(segments as usize * 2 + 3);
+    let angle = |i: u32| start + (end - start) * i as f32 / segments as f32;
+    let at = |radius: f32, a: f32| Vec2::new(ops::cos(a), ops::sin(a)) * radius;
+    commands.push(PathCommand::MoveTo(at(outer, angle(0))));
+    for i in 1..=segments {
+        commands.push(PathCommand::LineTo(at(outer, angle(i))));
+    }
+    for i in (0..=segments).rev() {
+        commands.push(PathCommand::LineTo(at(inner, angle(i))));
+    }
+    commands.push(PathCommand::Close);
+    commands
+}
+
+fn arc_sweep(t: f32, speed: f32, phase: f32) -> f32 {
+    0.75 * std::f32::consts::TAU * (0.5 + 0.5 * ops::sin(t * speed + phase))
+}
+
+/// Workload 2, engine/vello: rewrite the arc paths every frame.
+fn animate_arcs(
+    frame: Res<FrameCount>,
+    mut query: Query<(&Animated, &DynamicArc, &mut bevy_pf_vector::VectorShape)>,
+) {
+    let t = frame.0 as f32 / 120.0;
+    for (anim, arc, mut shape) in &mut query {
+        let sweep = arc_sweep(t, anim.speed, anim.phase);
+        shape.commands = ring_segment_path(arc.outer, arc.inner, -0.75, -0.75 + sweep, 40);
+    }
+}
+
+/// Workload 2, shapes control: mutate the SDF disc's arc angles (its native
+/// dynamic-parameter path — no re-tessellation in that model).
+fn animate_discs(
+    frame: Res<FrameCount>,
+    mut query: Query<(&Animated, &DynamicArc, &mut DiscComponent)>,
+) {
+    let t = frame.0 as f32 / 120.0;
+    for (anim, _arc, mut disc) in &mut query {
+        let sweep = arc_sweep(t, anim.speed, anim.phase);
+        disc.start_angle = -0.75;
+        disc.end_angle = -0.75 + sweep;
+    }
+}
 
 const HUD_PALETTE: [Color; 6] = [
     Color::srgb(0.91, 0.30, 0.24),
@@ -198,6 +269,21 @@ fn setup_shapes(mut commands: Commands, cfg: Res<BenchConfig>) {
         // the animation path is identical across shape kinds.
         let (transform, anim) = animated(pos, size, &mut rng);
         config.transform = transform;
+
+        // Workload 2 mirror: SDF arc discs with animated sweep — the
+        // control's native dynamic-parameter path.
+        if i < cfg.dynamic {
+            config.hollow = true;
+            config.thickness = 0.38;
+            config.cap = Cap::None;
+            commands
+                .spawn(ShapeBundle::new(
+                    &config,
+                    DiscComponent::arc(&config, 1.0, -0.75, 1.6),
+                ))
+                .insert((anim, DynamicArc { outer: size, inner: size * 0.62 }));
+            continue;
+        }
 
         let kind = rng.pick(100);
         match kind {
@@ -375,6 +461,23 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
         let color = HUD_PALETTE[rng.pick(HUD_PALETTE.len() as u32) as usize].to_linear();
         // Same rng draws as the control; scale stays 1.0 — size is in the path.
         let (transform, anim) = animated(pos, 1.0, &mut rng);
+
+        // Workload 2: the first `dynamic` elements are gauge arcs whose
+        // sweep rewrites the path every frame. No extra rng draws, so the
+        // stream stays aligned with the other backends.
+        if i < cfg.dynamic {
+            let (outer, inner) = (size, size * 0.62);
+            commands.spawn((
+                VectorShape {
+                    commands: ring_segment_path(outer, inner, -0.75, 1.6, 40),
+                    style: fill(color),
+                },
+                transform,
+                anim,
+                DynamicArc { outer, inner },
+            ));
+            continue;
+        }
 
         let kind = rng.pick(100);
         let shape = match kind {
@@ -669,15 +772,19 @@ fn main() {
     .add_systems(Update, (animate, sample).chain());
 
     match cfg.backend {
-        Backend::Shapes => app.add_systems(Startup, setup_shapes),
+        Backend::Shapes => app
+            .add_systems(Startup, setup_shapes)
+            .add_systems(Update, animate_discs.after(animate).before(sample)),
         Backend::Sprites => app.add_systems(Startup, setup_sprites),
         Backend::Engine => app
             .add_plugins(bevy_pf_vector::PfVectorPlugin)
-            .add_systems(Startup, setup_engine),
+            .add_systems(Startup, setup_engine)
+            .add_systems(Update, animate_arcs.after(animate).before(sample)),
         // Same VectorShape entities as the engine backend, rendered by vello.
         Backend::Vello => app
             .add_plugins(vello_backend::VelloBackendPlugin)
-            .add_systems(Startup, setup_engine),
+            .add_systems(Startup, setup_engine)
+            .add_systems(Update, animate_arcs.after(animate).before(sample)),
     };
 
     app.run();

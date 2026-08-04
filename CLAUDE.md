@@ -105,6 +105,22 @@ from any reference renderer:
   the reproducibility artifact.
 - Skia / Pathfinder: unmeasured, would need standalone harnesses.
 
+## Workload 2 status (2026-08-03)
+
+Dynamic topology is implemented: shapes whose VectorShape mutates
+tessellate into a transient tail region of the shared buffers (unchanged
+shapes stay cached; stable-size dynamic shapes keep the prepare fast path;
+epoch flush caps cache growth). Results (200 el / 50 animated arcs, p50):
+shapes control 0.99 ms frame (SDF params are its native model), vello 1.19,
+engine 1.52 frame but 0.0092 ms GPU (2.3x better than control). Profiling
+(bevy/trace_chrome feature; parse the trace-*.json B/E spans) attributed
+the frame gap to extract-side re-tessellation; switching all hot-path
+hashing to foldhash (tess::fast_hasher) recovered 0.3 ms here and 0.29 ms
+on the 5000-static frame (now 1.16 ms). The structural fix for workload 2
+is PARAMETRIC INSTANCED PRIMITIVES: canonical (t, side) strip meshes whose
+vertex shader computes arc/bar geometry from per-instance params — makes
+parameter animation zero-CPU and should win workload-2 frame time outright.
+
 ## Next tasks
 
 - Bevy-overhead levers (renderer is no longer the frame bottleneck at 5000
