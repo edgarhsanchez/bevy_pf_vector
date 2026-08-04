@@ -1,49 +1,73 @@
-// bevy_pf_vector — instanced vector geometry.
+// bevy_pf_vector — instanced vector geometry with analytic edge AA.
 //
-// Vertices are pre-tessellated path meshes in local space. Instances are
-// 36 bytes: a 2x2 affine + translation + depth + packed RGBA8 color —
-// 2D needs no mat4, and slim instances halve vertex-fetch bandwidth on
-// every GPU architecture.
+// Vertices are pre-tessellated path meshes in local space, carrying an
+// outward silhouette normal and a coverage value. Fringe vertices
+// (coverage 0) are displaced exactly one screen pixel outward in the vertex
+// shader, so antialiasing is resolution- and zoom-independent while the
+// geometry stays static. Interior vertices have zero normal — no movement.
 //
-// Two pipeline variants share these entry points: opaque (depth write,
-// no blend — early-z rejects hidden HUD fragments on both immediate-mode
-// and tile-based GPUs) and blended (back-to-front, depth read-only).
+// This removes the need for MSAA: interiors render on the opaque early-z
+// pipeline, fringes alpha-blend, edges resolve analytically.
+//
+// Instances are 36 bytes: 2x2 affine + translation + depth + RGBA8 color.
 
 struct VectorView {
     clip_from_world: mat4x4<f32>,
+    // xy = viewport size in physical pixels.
+    viewport: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: VectorView;
 
 struct VertexIn {
     @location(0) position: vec2<f32>,
+    @location(1) normal: vec2<f32>,
+    @location(2) coverage: f32,
     // [m00, m01, m10, m11] — columns of the 2x2 linear part.
-    @location(1) i_linear: vec4<f32>,
+    @location(3) i_linear: vec4<f32>,
     // [tx, ty, z, unused]
-    @location(2) i_translation_z: vec4<f32>,
+    @location(4) i_translation_z: vec4<f32>,
     // Unorm8x4 — hardware-expanded to 0..1 floats for free.
-    @location(3) i_color: vec4<f32>,
+    @location(5) i_color: vec4<f32>,
 }
 
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) coverage: f32,
 }
 
 @vertex
 fn vertex(in: VertexIn) -> VertexOut {
-    let world_xy = vec2<f32>(
+    var world_xy = vec2<f32>(
         in.i_linear.x * in.position.x + in.i_linear.z * in.position.y + in.i_translation_z.x,
         in.i_linear.y * in.position.x + in.i_linear.w * in.position.y + in.i_translation_z.y,
     );
+
+    // Fringe displacement: rotate/scale the silhouette normal by the
+    // instance's linear part, renormalize (so instance scale never changes
+    // fringe width), and push outward by one screen pixel expressed in world
+    // units. clip_from_world[0][0] == 2 / world_width for an unrotated 2D
+    // camera, so one pixel is 2 / (clip00 * viewport_width) world units.
+    let world_normal = vec2<f32>(
+        in.i_linear.x * in.normal.x + in.i_linear.z * in.normal.y,
+        in.i_linear.y * in.normal.x + in.i_linear.w * in.normal.y,
+    );
+    let len = length(world_normal);
+    if (len > 1.0e-6) {
+        let px_world = 2.0 / (view.clip_from_world[0][0] * view.viewport.x);
+        world_xy += (world_normal / len) * px_world;
+    }
+
     var out: VertexOut;
     out.clip_position =
         view.clip_from_world * vec4<f32>(world_xy, in.i_translation_z.z, 1.0);
     out.color = in.i_color;
+    out.coverage = in.coverage;
     return out;
 }
 
 @fragment
 fn fragment(in: VertexOut) -> @location(0) vec4<f32> {
-    return in.color;
+    return vec4<f32>(in.color.rgb, in.color.a * in.coverage);
 }

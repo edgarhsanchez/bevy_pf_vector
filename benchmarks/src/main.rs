@@ -356,7 +356,10 @@ fn setup_engine(mut commands: Commands, cfg: Res<BenchConfig>) {
         commands
     }
 
-    commands.spawn(Camera2d);
+    // Analytic fringe AA makes MSAA redundant for the engine — single-sample
+    // rendering is part of its shipped configuration, as MSAA 4x is part of
+    // the control's.
+    commands.spawn((Camera2d, bevy::render::view::Msaa::Off));
     let mut rng = Rng(0xB3_59_1D);
 
     for i in 0..cfg.elements {
@@ -616,6 +619,10 @@ fn main() {
     let mut wgpu_settings = WgpuSettings::default();
     wgpu_settings.features |=
         WgpuFeatures::TIMESTAMP_QUERY | WgpuFeatures::PIPELINE_STATISTICS_QUERY;
+    // Lets the engine backend collapse each phase into one multi-draw
+    // (indirect args carry first_instance). Desktop Vulkan/DX12 support
+    // this; the engine falls back to a draw loop where it's absent.
+    wgpu_settings.features |= WgpuFeatures::INDIRECT_FIRST_INSTANCE;
 
     let mut app = App::new();
     app.add_plugins(

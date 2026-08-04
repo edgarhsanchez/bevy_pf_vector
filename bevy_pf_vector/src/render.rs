@@ -2,20 +2,24 @@
 //! persistent buffers, pipelines, and the vector pass itself.
 //!
 //! Performance model (portable across NVIDIA/AMD/Intel/Apple via wgpu — no
-//! vendor extensions):
+//! vendor extensions, optional features detected at runtime):
 //! - Geometry is tessellated once per unique content hash and lives in
 //!   persistent vertex/index buffers. Steady-state per-frame CPU work is
 //!   hashing + one 36-byte instance write per shape.
 //! - Exact-coverage triangles mean near-zero overdraw, unlike SDF quad
 //!   renderers that shade full bounding rects.
-//! - Opaque instances (alpha == 1, the HUD common case) draw with depth
-//!   write + test and no blending: early-z rejects hidden fragments on both
-//!   immediate-mode and tile-based GPUs, and draw order becomes irrelevant,
-//!   so opaque batches group purely by geometry for maximal instancing.
-//! - Only translucent instances pay blend cost, back-to-front, depth
-//!   read-only.
-//! - Instances are 36 bytes (2x2 affine + translation + z + RGBA8), not a
-//!   mat4 — half the vertex-fetch bandwidth of the naive layout.
+//! - Edges antialias analytically: a one-screen-pixel fringe extruded in
+//!   the vertex shader (see vector.wgsl), so the engine renders
+//!   single-sample — no 4x MSAA bandwidth tax, which especially matters on
+//!   tile-based GPUs.
+//! - Opaque interiors (alpha == 1, the HUD common case) draw with depth
+//!   write + test and no blending: early-z rejects hidden fragments, and
+//!   draw order becomes irrelevant, so opaque batches group purely by
+//!   geometry for maximal instancing. Translucent interiors and all fringes
+//!   blend back-to-front, depth read-only.
+//! - Where the device offers MULTI_DRAW_INDIRECT + INDIRECT_FIRST_INSTANCE
+//!   (desktop Vulkan/DX12), each phase submits as ONE
+//!   multi_draw_indexed_indirect; elsewhere a plain draw loop.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -33,10 +37,11 @@ use bevy::render::render_resource::{
     BlendState, Buffer, BufferInitDescriptor, BufferUsages, CachedRenderPipelineId,
     ColorTargetState, ColorWrites, CompareFunction, DepthBiasState, DepthStencilState,
     FragmentState, IndexFormat, MultisampleState, PipelineCache, PrimitiveState,
-    RenderPassDescriptor, RenderPipelineDescriptor, ShaderStages, StencilState, StoreOp,
-    TextureFormat, UniformBuffer, VertexFormat, VertexState, VertexStepMode,
+    RenderPassDescriptor, RenderPipelineDescriptor, ShaderStages, ShaderType, StencilState,
+    StoreOp, TextureFormat, UniformBuffer, VertexFormat, VertexState, VertexStepMode,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::settings::WgpuFeatures;
 use bevy::render::view::{ExtractedView, Msaa, ViewDepthTexture, ViewTarget};
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
 use bevy::shader::Shader;
@@ -77,10 +82,14 @@ impl Plugin for VectorRenderPlugin {
 
 // ---------------------------------------------------------------- gpu data
 
+/// 20 bytes: position, outward silhouette normal (zero for interior
+/// vertices), coverage.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuVertex {
     position: [f32; 2],
+    normal: [f32; 2],
+    coverage: f32,
 }
 
 /// 36 bytes. Columns of the 2x2 linear part, translation + z, RGBA8 color.
@@ -92,8 +101,32 @@ struct GpuInstance {
     color: [u8; 4],
 }
 
+/// Layout-compatible with wgpu's DrawIndexedIndirectArgs.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuDrawIndexedIndirect {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+
+#[derive(ShaderType, Clone, Copy)]
+struct VectorViewUniform {
+    clip_from_world: Mat4,
+    viewport: Vec4,
+}
+
 fn vertex_buffer_layout() -> VertexBufferLayout {
-    VertexBufferLayout::from_vertex_formats(VertexStepMode::Vertex, [VertexFormat::Float32x2])
+    VertexBufferLayout::from_vertex_formats(
+        VertexStepMode::Vertex,
+        [
+            VertexFormat::Float32x2,
+            VertexFormat::Float32x2,
+            VertexFormat::Float32,
+        ],
+    )
 }
 
 fn instance_buffer_layout() -> VertexBufferLayout {
@@ -106,9 +139,9 @@ fn instance_buffer_layout() -> VertexBufferLayout {
         ],
     );
     // from_vertex_formats numbers locations from 0; instance attributes
-    // follow the vertex buffer's location 0.
+    // follow the three vertex-buffer locations.
     for (i, attribute) in layout.attributes.iter_mut().enumerate() {
-        attribute.shader_location = 1 + i as u32;
+        attribute.shader_location = 3 + i as u32;
     }
     layout
 }
@@ -118,8 +151,10 @@ fn instance_buffer_layout() -> VertexBufferLayout {
 #[derive(Clone, Copy)]
 struct GeometryRange {
     base_vertex: i32,
-    first_index: u32,
-    index_count: u32,
+    interior_first: u32,
+    interior_count: u32,
+    fringe_first: u32,
+    fringe_count: u32,
 }
 
 /// Tessellated geometry, appended once per unique content hash. Persistent
@@ -139,15 +174,22 @@ impl GeometryCache {
         }
         let range = tessellate().map(|geometry| {
             let base_vertex = self.vertices.len() as i32;
-            let first_index = self.indices.len() as u32;
-            self.vertices
-                .extend(geometry.vertices.iter().map(|&position| GpuVertex { position }));
-            self.indices.extend_from_slice(&geometry.indices);
+            self.vertices.extend(geometry.vertices.iter().map(|v| GpuVertex {
+                position: v.position,
+                normal: v.normal,
+                coverage: v.coverage,
+            }));
+            let interior_first = self.indices.len() as u32;
+            self.indices.extend_from_slice(&geometry.interior_indices);
+            let fringe_first = self.indices.len() as u32;
+            self.indices.extend_from_slice(&geometry.fringe_indices);
             self.dirty = true;
             GeometryRange {
                 base_vertex,
-                first_index,
-                index_count: geometry.indices.len() as u32,
+                interior_first,
+                interior_count: geometry.interior_indices.len() as u32,
+                fringe_first,
+                fringe_count: geometry.fringe_indices.len() as u32,
             }
         });
         self.ranges.insert(key, range);
@@ -178,14 +220,24 @@ pub struct VectorBuffers {
     index: Option<Buffer>,
     instance: Option<Buffer>,
     instance_capacity: usize,
+    indirect: Option<Buffer>,
+    indirect_capacity: usize,
+    /// Batch counts per phase when multi-draw is active; batch lists always.
     opaque_batches: Vec<VectorBatch>,
     blend_batches: Vec<VectorBatch>,
+    use_multi_draw: bool,
 }
 
 #[derive(Default)]
 struct ViewEntry {
-    uniform: UniformBuffer<Mat4>,
+    uniform: UniformBuffer<VectorViewUniform>,
     bind_group: Option<BindGroup>,
+}
+
+impl Default for VectorViewUniform {
+    fn default() -> Self {
+        Self { clip_from_world: Mat4::IDENTITY, viewport: Vec4::ONE }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -206,7 +258,7 @@ impl Default for VectorPipeline {
                 "pf_vector_view_layout",
                 &BindGroupLayoutEntries::single(
                     ShaderStages::VERTEX,
-                    uniform_buffer::<Mat4>(false),
+                    uniform_buffer::<VectorViewUniform>(false),
                 ),
             ),
             variants: HashMap::new(),
@@ -348,32 +400,19 @@ fn queue_vector_pipelines(
     }
 }
 
-fn push_batch(
-    batches: &mut Vec<VectorBatch>,
-    range: GeometryRange,
-    instance_index: u32,
-    contiguous: bool,
-) {
-    if contiguous {
-        batches.last_mut().unwrap().instances.end = instance_index + 1;
-    } else {
-        batches.push(VectorBatch {
-            indices: range.first_index..range.first_index + range.index_count,
-            base_vertex: range.base_vertex,
-            instances: instance_index..instance_index + 1,
-        });
-    }
-}
-
-/// Uploads geometry when it changed and rebuilds the per-frame instance
-/// buffer. Opaque instances sort by geometry (depth testing makes order
-/// irrelevant) for maximal instancing; translucent ones sort back-to-front
-/// and batch only adjacent runs.
+/// Uploads geometry when it changed, then builds the per-frame instance and
+/// batch lists:
+/// - opaque interiors, grouped by geometry (depth testing makes order
+///   irrelevant) for maximal instancing;
+/// - blend items back-to-front: translucent interiors and every silhouette
+///   fringe, batching adjacent runs of the same (geometry, part).
+/// When the device supports it, batches are also encoded into an indirect
+/// args buffer so the pass is two multi-draw calls.
 fn prepare_vector_buffers(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     mut cache: ResMut<GeometryCache>,
-    mut extracted: ResMut<ExtractedShapes>,
+    extracted: Res<ExtractedShapes>,
     mut buffers: ResMut<VectorBuffers>,
 ) {
     if cache.dirty && !cache.vertices.is_empty() {
@@ -390,52 +429,90 @@ fn prepare_vector_buffers(
         cache.dirty = false;
     }
 
-    // Opaque first (grouped by geometry, front-to-back within a group),
-    // then translucent back-to-front.
-    extracted.0.sort_unstable_by(|a, b| {
-        b.opaque
-            .cmp(&a.opaque)
-            .then_with(|| {
-                if a.opaque {
-                    a.geometry.cmp(&b.geometry).then(b.z.total_cmp(&a.z))
-                } else {
-                    a.z.total_cmp(&b.z)
-                }
-            })
-    });
-
     buffers.opaque_batches.clear();
     buffers.blend_batches.clear();
-    let mut instances: Vec<GpuInstance> = Vec::with_capacity(extracted.0.len());
-    let mut last_key: Option<(u64, bool)> = None;
-    for instance in &extracted.0 {
-        let Some(Some(range)) = cache.ranges.get(&instance.geometry) else {
-            continue;
-        };
+
+    let mut instances: Vec<GpuInstance> = Vec::with_capacity(extracted.0.len() * 2);
+    let push_instance = |instances: &mut Vec<GpuInstance>, item: &ExtractedInstance| -> u32 {
         let index = instances.len() as u32;
         instances.push(GpuInstance {
-            linear: instance.linear,
-            translation_z: [
-                instance.translation[0],
-                instance.translation[1],
-                instance.z,
-                0.0,
-            ],
-            color: instance.color,
+            linear: item.linear,
+            translation_z: [item.translation[0], item.translation[1], item.z, 0.0],
+            color: item.color,
         });
-        let contiguous = last_key == Some((instance.geometry, instance.opaque));
-        let batches = if instance.opaque {
-            &mut buffers.opaque_batches
-        } else {
-            &mut buffers.blend_batches
+        index
+    };
+
+    // Section 1: opaque interiors, geometry-grouped, front-to-back in group.
+    let mut opaque_order: Vec<usize> = (0..extracted.0.len())
+        .filter(|&i| extracted.0[i].opaque)
+        .collect();
+    opaque_order.sort_unstable_by(|&a, &b| {
+        let (ia, ib) = (&extracted.0[a], &extracted.0[b]);
+        ia.geometry.cmp(&ib.geometry).then(ib.z.total_cmp(&ia.z))
+    });
+    let mut last_geometry: Option<u64> = None;
+    for &item_index in &opaque_order {
+        let item = &extracted.0[item_index];
+        let Some(Some(range)) = cache.ranges.get(&item.geometry) else {
+            continue;
         };
-        push_batch(batches, *range, index, contiguous);
-        last_key = Some((instance.geometry, instance.opaque));
+        if range.interior_count == 0 {
+            continue;
+        }
+        let index = push_instance(&mut instances, item);
+        if last_geometry == Some(item.geometry) {
+            buffers.opaque_batches.last_mut().unwrap().instances.end = index + 1;
+        } else {
+            buffers.opaque_batches.push(VectorBatch {
+                indices: range.interior_first..range.interior_first + range.interior_count,
+                base_vertex: range.base_vertex,
+                instances: index..index + 1,
+            });
+            last_geometry = Some(item.geometry);
+        }
+    }
+
+    // Section 2: blend items, back-to-front. Each item is (source instance,
+    // part); a translucent shape contributes interior + fringe, an opaque
+    // one only its fringe.
+    let mut blend_order: Vec<(usize, bool)> = Vec::new();
+    let mut z_sorted: Vec<usize> = (0..extracted.0.len()).collect();
+    z_sorted.sort_by(|&a, &b| extracted.0[a].z.total_cmp(&extracted.0[b].z));
+    for &item_index in &z_sorted {
+        if !extracted.0[item_index].opaque {
+            blend_order.push((item_index, false));
+        }
+        blend_order.push((item_index, true));
+    }
+    let mut last_key: Option<(u64, bool)> = None;
+    for &(item_index, is_fringe) in &blend_order {
+        let item = &extracted.0[item_index];
+        let Some(Some(range)) = cache.ranges.get(&item.geometry) else {
+            continue;
+        };
+        let (first, count) = if is_fringe {
+            (range.fringe_first, range.fringe_count)
+        } else {
+            (range.interior_first, range.interior_count)
+        };
+        if count == 0 {
+            continue;
+        }
+        let index = push_instance(&mut instances, item);
+        if last_key == Some((item.geometry, is_fringe)) {
+            buffers.blend_batches.last_mut().unwrap().instances.end = index + 1;
+        } else {
+            buffers.blend_batches.push(VectorBatch {
+                indices: first..first + count,
+                base_vertex: range.base_vertex,
+                instances: index..index + 1,
+            });
+            last_key = Some((item.geometry, is_fringe));
+        }
     }
 
     if instances.is_empty() {
-        buffers.opaque_batches.clear();
-        buffers.blend_batches.clear();
         return;
     }
     let bytes: &[u8] = bytemuck::cast_slice(&instances);
@@ -448,6 +525,39 @@ fn prepare_vector_buffers(
         buffers.instance_capacity = bytes.len();
     } else if let Some(buffer) = &buffers.instance {
         queue.write_buffer(buffer, 0, bytes);
+    }
+
+    // Indirect args: one multi-draw per phase where the device allows it.
+    // wgpu 29 exposes multi_draw_indexed_indirect unconditionally (native
+    // single-call on Vulkan/DX12, emulated per-arg elsewhere); only
+    // first_instance-in-indirect-args needs a feature gate.
+    buffers.use_multi_draw = device
+        .features()
+        .contains(WgpuFeatures::INDIRECT_FIRST_INSTANCE);
+    if buffers.use_multi_draw {
+        let args: Vec<GpuDrawIndexedIndirect> = buffers
+            .opaque_batches
+            .iter()
+            .chain(buffers.blend_batches.iter())
+            .map(|batch| GpuDrawIndexedIndirect {
+                index_count: batch.indices.end - batch.indices.start,
+                instance_count: batch.instances.end - batch.instances.start,
+                first_index: batch.indices.start,
+                base_vertex: batch.base_vertex,
+                first_instance: batch.instances.start,
+            })
+            .collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&args);
+        if buffers.indirect.is_none() || buffers.indirect_capacity < bytes.len() {
+            buffers.indirect = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("pf_vector_indirect"),
+                contents: bytes,
+                usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            }));
+            buffers.indirect_capacity = bytes.len();
+        } else if let Some(buffer) = &buffers.indirect {
+            queue.write_buffer(buffer, 0, bytes);
+        }
     }
 }
 
@@ -462,8 +572,9 @@ fn prepare_view_bind_groups(
         let clip_from_world = view.clip_from_world.unwrap_or_else(|| {
             view.clip_from_view * view.world_from_view.to_matrix().inverse()
         });
+        let viewport = view.viewport.as_vec4();
         let entry = bind_groups.per_view.entry(entity).or_default();
-        entry.uniform.set(clip_from_world);
+        entry.uniform.set(VectorViewUniform { clip_from_world, viewport });
         entry.uniform.write_buffer(&device, &queue);
         if entry.bind_group.is_none() {
             let layout = device
@@ -478,8 +589,9 @@ fn prepare_view_bind_groups(
 }
 
 /// The vector pass. Runs in the `Core2d` schedule after the main pass:
-/// opaque batches first (depth write, no blend), then translucent
-/// back-to-front (depth read-only, alpha blend).
+/// opaque interiors first (depth write, no blend, early-z), then blend items
+/// back-to-front (translucent interiors + AA fringes, depth read-only).
+/// Two multi-draw calls total when the device supports indirect.
 fn vector_pass(
     pipeline: Res<VectorPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -545,16 +657,45 @@ fn vector_pass(
     pass.set_vertex_buffer(1, instance.slice(..));
     pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
 
+    let indirect = buffers.use_multi_draw.then(|| buffers.indirect.as_ref()).flatten();
+    let args_size = size_of::<GpuDrawIndexedIndirect>() as u64;
+
     if !buffers.opaque_batches.is_empty() {
         pass.set_render_pipeline(opaque_pipeline);
-        for batch in &buffers.opaque_batches {
-            pass.draw_indexed(batch.indices.clone(), batch.base_vertex, batch.instances.clone());
+        match indirect {
+            Some(indirect) => pass.multi_draw_indexed_indirect(
+                indirect,
+                0,
+                buffers.opaque_batches.len() as u32,
+            ),
+            None => {
+                for batch in &buffers.opaque_batches {
+                    pass.draw_indexed(
+                        batch.indices.clone(),
+                        batch.base_vertex,
+                        batch.instances.clone(),
+                    );
+                }
+            }
         }
     }
     if !buffers.blend_batches.is_empty() {
         pass.set_render_pipeline(blend_pipeline);
-        for batch in &buffers.blend_batches {
-            pass.draw_indexed(batch.indices.clone(), batch.base_vertex, batch.instances.clone());
+        match indirect {
+            Some(indirect) => pass.multi_draw_indexed_indirect(
+                indirect,
+                buffers.opaque_batches.len() as u64 * args_size,
+                buffers.blend_batches.len() as u32,
+            ),
+            None => {
+                for batch in &buffers.blend_batches {
+                    pass.draw_indexed(
+                        batch.indices.clone(),
+                        batch.base_vertex,
+                        batch.instances.clone(),
+                    );
+                }
+            }
         }
     }
 

@@ -60,15 +60,25 @@ mostly-static topology, so tessellate once and GPU-instance every frame.
 
 ## Engine status (2026-08-03)
 
-The vertical slice is implemented, proven in the testbed (engine output
-matches gizmo ground truth), and measured. Workload 1, RTX A6000/Vulkan,
-p50: 200 elements 0.0174 ms GPU (control 0.0225); 5000 elements 0.324 ms
-GPU (control 0.932), CPU frame 1.66 ms (control 3.73). Design points, all
-portable wgpu: tessellate-once keyed by content hash; exact-coverage
-triangles (~4x fewer fragment invocations than SDF quads); opaque/blend
-split — opaque draws with early-z depth write, grouped by geometry for
-instancing since depth makes order irrelevant; 36-byte instances
-(2x2 affine + translation + z + RGBA8).
+Implemented, proven in the testbed (engine output matches gizmo ground
+truth; single-sample AA verified by screenshot), and measured. Workload 1,
+RTX A6000/Vulkan, p50: 200 elements 0.0082 ms GPU (control 0.0225 = 2.7x);
+5000 elements 0.137 ms GPU (control 0.932 = 6.8x), pass-record CPU
+0.0019 ms (control 0.322). Design points, all portable wgpu, no code taken
+from any reference renderer:
+
+- tessellate-once keyed by content hash; exact-coverage triangles (~4x
+  fewer fragment invocations than SDF quads)
+- analytic AA: mesh-boundary fringe (boundary edges extracted from the
+  tessellation with signed-area orientation correction, averaged outward
+  vertex normals) extruded one screen pixel in the vertex shader —
+  single-sample rendering, no MSAA; engine cameras use Msaa::Off
+- opaque/blend split — opaque interiors draw with early-z depth write
+  grouped by geometry (order-free under depth), translucent interiors +
+  all fringes blend back-to-front
+- 36-byte instances (2x2 affine + translation + z + RGBA8); one
+  multi_draw_indexed_indirect per phase when INDIRECT_FIRST_INSTANCE is
+  available (runtime-detected), draw loop otherwise
 
 ## Next tasks
 

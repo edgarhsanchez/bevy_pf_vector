@@ -44,17 +44,31 @@ vertex/primitive counts, and a 200 → 5000 element sweep scales GPU time 38x.
 
 ## Workload 1 results (RTX A6000, Vulkan — p50 over 600 frames)
 
-| backend | 200 el GPU | 5000 el GPU | 5000 el CPU frame | 5000 el fragment inv. |
-|---|---|---|---|---|
-| shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | 3.73 ms | 32.3 M |
-| **engine (`--backend engine`)** | **0.0174 ms** | **0.324 ms** | **1.66 ms** | **7.8 M** |
+Each backend measured at its shipped configuration: the control under its
+default MSAA 4x, the engine single-sample (its AA is analytic).
 
-The engine wins by structure, not tuning: exact-coverage tessellated
-triangles shade ~4x fewer fragments than SDF bounding quads, opaque HUD
-content renders with early-z depth testing instead of blending, and
-instances are 36 bytes. Measured on NVIDIA/Vulkan only so far — AMD, Intel,
-and Apple/Metal numbers are pending hardware access, and every technique
-used is portable wgpu (no vendor extensions).
+| backend | 200 el GPU | 5000 el GPU | 5000 el pass-record CPU |
+|---|---|---|---|
+| shapes (bevy_vector_shapes control) | 0.0225 ms | 0.932 ms | 0.322 ms |
+| engine, first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | 0.035 ms |
+| **engine, current** | **0.0082 ms** | **0.137 ms (6.8x)** | **0.0019 ms** |
+
+The engine wins by structure, not tuning:
+
+- exact-coverage tessellated triangles — ~4x fewer fragment invocations
+  than SDF bounding quads at 5000 elements;
+- analytic edge AA: a one-screen-pixel silhouette fringe extruded in the
+  vertex shader (geometry stays static, width is resolution- and
+  zoom-independent), so the engine renders single-sample — no 4x MSAA
+  bandwidth tax;
+- opaque HUD content draws with early-z depth testing instead of blending,
+  grouped by geometry for maximal instancing;
+- 36-byte instances; each phase submits as one `multi_draw_indexed_indirect`
+  where the device offers indirect-first-instance (fallback: plain loop).
+
+Measured on NVIDIA/Vulkan only so far — AMD, Intel, and Apple/Metal numbers
+are pending hardware access, and every technique used is portable wgpu (no
+vendor extensions; optional features detected at runtime).
 
 Vendoring benchmark opponents (optional, from Git Bash):
 
