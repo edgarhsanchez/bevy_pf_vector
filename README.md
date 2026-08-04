@@ -58,6 +58,29 @@ visually via `--screenshot` for engine and vello.
 | engine, first slice (MSAA 4x) | 0.0174 ms | 0.324 ms | — |
 | **engine, current** | **0.0082 ms** | **0.137 ms** | **none (tessellate-once)** |
 
+**Native Rive Renderer (C++), measured.** Built from rive-runtime at the
+pinned SHA (clang/lld, Vulkan backend, SPIR-V via glslang) with a local
+`--bench N` patch (`benchmarks/rive-native-bench.patch`) that ports this
+harness's exact workload generator (same SplitMix64 stream, layout, kinds,
+retained RenderPaths) into `path_fiddle`. Runs on its **interlock fast
+path** (`fragmentShaderPixelInterlock` active) at 2560x1440, uncapped
+present. Its minimal GLFW loop does nothing but render, so frame time ~=
+renderer cost:
+
+| | 200 el | 5000 el |
+|---|---|---|
+| rive native frame (p50) | 0.204 ms | 1.716 ms |
+| engine renderer cost (GPU pass + record + prepare) | ~0.015 ms | ~0.19 ms |
+
+Renderer-for-renderer the engine is roughly an order of magnitude faster at
+both scales, and our entire Bevy frame at 5000 elements (1.66 ms, ECS and
+all) matches rive's render-only loop (1.72 ms). Rive pays per-frame path
+processing and flush work by design — the cost this engine's
+tessellate-once model eliminates. Caveats: rive numbers are frame-time (its
+loop is render-only, but CPU/GPU overlap means GPU-only could be lower);
+comparison is Vulkan-on-NVIDIA only; rive's atomic/MSAA fallback modes and
+feather/clip-heavy content (workloads 3-4) not yet measured.
+
 Engine vs vello: ~100x at 200 elements, ~11x at 5000. Vello's ~0.8 ms floor
 at low element counts is its canvas-sized compute pipeline — the per-frame
 cost a general-purpose renderer pays regardless of content, and exactly what

@@ -1,0 +1,385 @@
+diff --git a/renderer/path_fiddle/path_fiddle.cpp b/renderer/path_fiddle/path_fiddle.cpp
+index a33cb159..16c93f6e 100644
+--- a/renderer/path_fiddle/path_fiddle.cpp
++++ b/renderer/path_fiddle/path_fiddle.cpp
+@@ -228,6 +228,8 @@ int lastWidth = 0, lastHeight = 0;
+ double fpsLastTime = 0;
+ double fpsLastTimeLogic = 0;
+ int fpsFrames = 0;
++// pf_vector benchmark mode element count (--bench N); see pfbench below.
++int g_benchElements = 0;
+ static bool needsTitleUpdate = false;
+ 
+ enum class API
+@@ -657,6 +659,10 @@ int main(int argc, const char** argv)
+         {
+             options.gpuNameFilter = "integrated";
+         }
++        else if (sscanf(argv[i], "--bench%i", &g_benchElements) == 1)
++        {
++            // pf_vector benchmark mode; see pfbench above.
++        }
+         else if (!strncmp(argv[i], "--", 2))
+         {
+             fprintf(stderr, "Unknown command-line option %s\n", argv[i]);
+@@ -732,7 +738,11 @@ int main(int argc, const char** argv)
+     }
+     glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_TRUE);
+     // glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+-    window = glfwCreateWindow(1600, 1600, "Rive Renderer", nullptr, nullptr);
++    window = glfwCreateWindow(g_benchElements ? 2560 : 1600,
++                              g_benchElements ? 1440 : 1600,
++                              "Rive Renderer",
++                              nullptr,
++                              nullptr);
+     if (!window)
+     {
+         glfwTerminate();
+@@ -790,7 +800,7 @@ int main(int argc, const char** argv)
+         {
+             glfwSwapBuffers(window);
+         }
+-        if (!rivName.empty())
++        if (!rivName.empty() || g_benchElements)
+         {
+             glfwPollEvents();
+         }
+@@ -812,6 +822,311 @@ int main(int argc, const char** argv)
+     return 0;
+ }
+ 
++// ---------------------------------------------------------------------------
++// pf_vector benchmark mode (--bench N): renders the rng-identical workload-1
++// scene from the bevy_pf_vector benchmark harness through the Rive Renderer,
++// with retained RenderPaths/RenderPaints (a well-written rive app), animated
++// transforms, and frame-time sampling matching the harness (120 warmup / 600
++// samples, p50/p95/p99). Local patch for benchmarking only.
++namespace pfbench
++{
++struct Rng
++{
++    uint64_t s;
++    uint64_t next()
++    {
++        s += 0x9E3779B97F4A7C15ull;
++        uint64_t z = s;
++        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
++        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
++        return z ^ (z >> 31);
++    }
++    float f32() { return (float)(next() >> 40) / (float)(1ull << 24); }
++    float range(float lo, float hi) { return lo + (hi - lo) * f32(); }
++    uint32_t pick(uint32_t n) { return (uint32_t)(next() % n); }
++};
++
++struct Element
++{
++    rive::rcp<rive::RenderPath> path;
++    rive::rcp<rive::RenderPaint> paint;
++    float tx, ty, baseRot, phase, speed;
++};
++
++static std::vector<Element> elements;
++static std::vector<double> samples;
++static int frameNum = 0;
++static double lastTime = 0;
++constexpr int kWarmup = 120;
++constexpr int kFrames = 600;
++constexpr float kTau = 6.2831853f;
++
++static const uint32_t kPalette[6] = {0xffe84d3d,
++                                     0xff2ecc70,
++                                     0xff3399db,
++                                     0xfff2c40f,
++                                     0xff9c59b5,
++                                     0xffebebeb};
++
++static void quadTo(RawPath& p, float2 from, float2 ctrl, float2 to)
++{
++    // Elevate quadratic to cubic (RawPath speaks cubics).
++    float2 c0 = simd::mix(from, ctrl, float2(2 / 3.f));
++    float2 c1 = simd::mix(to, ctrl, float2(2 / 3.f));
++    p.cubicTo(c0.x, c0.y, c1.x, c1.y, to.x, to.y);
++}
++
++static RawPath circlePath(float r)
++{
++    constexpr float k = 0.55228475f;
++    RawPath p;
++    p.moveTo(r, 0);
++    p.cubicTo(r, k * r, k * r, r, 0, r);
++    p.cubicTo(-k * r, r, -r, k * r, -r, 0);
++    p.cubicTo(-r, -k * r, -k * r, -r, 0, -r);
++    p.cubicTo(k * r, -r, r, -k * r, r, 0);
++    p.close();
++    return p;
++}
++
++static RawPath roundedRectPath(float w, float h, float r)
++{
++    float hw = w / 2, hh = h / 2;
++    r = std::min(r, std::min(hw, hh));
++    RawPath p;
++    if (r <= 0)
++    {
++        p.moveTo(-hw, hh);
++        p.lineTo(hw, hh);
++        p.lineTo(hw, -hh);
++        p.lineTo(-hw, -hh);
++        p.close();
++        return p;
++    }
++    p.moveTo(-hw + r, hh);
++    p.lineTo(hw - r, hh);
++    quadTo(p, float2{hw - r, hh}, float2{hw, hh}, float2{hw, hh - r});
++    p.lineTo(hw, -hh + r);
++    quadTo(p, float2{hw, -hh + r}, float2{hw, -hh}, float2{hw - r, -hh});
++    p.lineTo(-hw + r, -hh);
++    quadTo(p, float2{-hw + r, -hh}, float2{-hw, -hh}, float2{-hw, -hh + r});
++    p.lineTo(-hw, hh - r);
++    quadTo(p, float2{-hw, hh - r}, float2{-hw, hh}, float2{-hw + r, hh});
++    p.close();
++    return p;
++}
++
++static RawPath ngonPath(uint32_t sides, float r)
++{
++    RawPath p;
++    for (uint32_t i = 0; i < sides; ++i)
++    {
++        float a = (float)i / sides * kTau + kTau / 4;
++        float x = cosf(a) * r, y = sinf(a) * r;
++        if (i == 0)
++            p.moveTo(x, y);
++        else
++            p.lineTo(x, y);
++    }
++    p.close();
++    return p;
++}
++
++static rive::rcp<rive::RenderPaint> makeFill(Factory* f, uint32_t color)
++{
++    auto paint = f->makeRenderPaint();
++    paint->color(color);
++    return paint;
++}
++
++static rive::rcp<rive::RenderPaint> makeStroke(Factory* f,
++                                                     uint32_t color,
++                                                     float width)
++{
++    auto paint = f->makeRenderPaint();
++    paint->style(RenderPaintStyle::stroke);
++    paint->color(color);
++    paint->thickness(width);
++    paint->join(StrokeJoin::round);
++    paint->cap(StrokeCap::round);
++    return paint;
++}
++
++// Port of the harness's setup_engine: identical rng consumption order.
++static void buildElements(Factory* factory)
++{
++    Rng rng{0xB3591D};
++    uint32_t total = (uint32_t)g_benchElements;
++    uint32_t cols =
++        std::max(1u, (uint32_t)ceilf(sqrtf((float)total * 16.f / 9.f)));
++    uint32_t rows = (total + cols - 1) / cols;
++    float cellW = 1180.f / cols, cellH = 620.f / rows;
++    for (uint32_t i = 0; i < total; ++i)
++    {
++        uint32_t col = i % cols, row = i / cols;
++        float x = -590.f + cellW * (col + 0.5f) + rng.range(-0.3f, 0.3f) * cellW;
++        float y =
++            -310.f + cellH * (row + 0.5f) + rng.range(-0.3f, 0.3f) * cellH;
++        float size = rng.range(9.f, 26.f);
++        uint32_t color = kPalette[rng.pick(6)];
++        float baseRot = rng.range(0, kTau);
++        float phase = rng.range(0, kTau);
++        float speed = rng.range(0.5f, 2.f);
++        uint32_t kind = rng.pick(100);
++
++        RawPath raw;
++        rive::rcp<rive::RenderPaint> paint;
++        if (kind < 40)
++        {
++            if (kind >= 20)
++            {
++                paint = makeStroke(factory, color, rng.range(0.1f, 0.3f) * size);
++            }
++            else
++            {
++                paint = makeFill(factory, color);
++            }
++            raw = circlePath(size);
++        }
++        else if (kind < 65)
++        {
++            float thickness =
++                kind >= 55 ? rng.range(0.1f, 0.25f) * size : -1.f;
++            float corner = kind % 2 == 0 ? rng.range(0.1f, 0.4f) * size : 0.f;
++            float aspect = rng.range(0.6f, 2.4f);
++            raw = roundedRectPath(2 * aspect * size, 2 * size, corner);
++            paint = thickness > 0 ? makeStroke(factory, color, thickness)
++                                  : makeFill(factory, color);
++        }
++        else if (kind < 80)
++        {
++            float thickness = kind >= 74 ? rng.range(0.1f, 0.3f) * size : -1.f;
++            uint32_t sides = 3 + rng.pick(6);
++            raw = ngonPath(sides, size);
++            paint = thickness > 0 ? makeStroke(factory, color, thickness)
++                                  : makeFill(factory, color);
++        }
++        else
++        {
++            float thickness = rng.range(0.15f, 0.4f) * size;
++            float dx = rng.range(-1.f, 1.f), dy = rng.range(-1.f, 1.f);
++            float len = sqrtf(dx * dx + dy * dy);
++            if (len <= 1e-6f)
++            {
++                dx = 1;
++                dy = 0;
++                len = 1;
++            }
++            dx = dx / len * size;
++            dy = dy / len * size;
++            raw.moveTo(-dx, -dy);
++            raw.lineTo(dx, dy);
++            paint = makeStroke(factory, color, thickness);
++        }
++
++        Element e;
++        e.path = factory->makeRenderPath(raw, FillRule::nonZero);
++        e.paint = std::move(paint);
++        e.tx = x;
++        e.ty = y;
++        e.baseRot = baseRot;
++        e.phase = phase;
++        e.speed = speed;
++        elements.push_back(std::move(e));
++    }
++}
++
++static void frame(Factory* factory, Renderer* renderer, int width, int height)
++{
++    if (elements.empty())
++    {
++        buildElements(factory);
++    }
++
++    double now = glfwGetTime();
++    ++frameNum;
++    if (lastTime != 0 && frameNum > kWarmup && samples.size() < kFrames)
++    {
++        samples.push_back((now - lastTime) * 1000.0);
++    }
++    lastTime = now;
++
++    // Same virtual-time animation as the harness.
++    float t = (float)frameNum / 120.f;
++    // World units are authored on a 1280x720 canvas; scale to framebuffer.
++    float s = (float)width / 1280.f;
++    for (auto& e : elements)
++    {
++        float a = e.baseRot + 0.35f * sinf(t * e.speed + e.phase);
++        float sc = 1.f + 0.05f * sinf(t * e.speed * 1.7f + e.phase);
++        float c = cosf(a) * sc, sn = sinf(a) * sc;
++        // World is y-up centered; canvas is y-down top-left.
++        Mat2D m(s * c,
++                -s * sn,
++                -s * sn,
++                -s * c,
++                width / 2.f + s * e.tx,
++                height / 2.f - s * e.ty);
++        renderer->save();
++        renderer->transform(m);
++        renderer->drawPath(e.path.get(), e.paint.get());
++        renderer->restore();
++    }
++
++    if (samples.size() >= kFrames)
++    {
++        std::vector<double> sorted = samples;
++        std::sort(sorted.begin(), sorted.end());
++        auto pct = [&](double p) {
++            return sorted[(size_t)llround(p / 100.0 * (sorted.size() - 1))];
++        };
++        double mean = 0;
++        for (double v : sorted)
++            mean += v;
++        mean /= sorted.size();
++        printf("\n== rive_native_bench | elements=%d frames=%d (warmup %d) "
++               "fb=%dx%d ==\n",
++               g_benchElements,
++               kFrames,
++               kWarmup,
++               width,
++               height);
++        printf("frame_ms  mean %.4f  p50 %.4f  p95 %.4f  p99 %.4f  min %.4f  "
++               "max %.4f\n",
++               mean,
++               pct(50),
++               pct(95),
++               pct(99),
++               sorted.front(),
++               sorted.back());
++        FILE* out = fopen("pf_rive_bench.json", "w");
++        if (out)
++        {
++            fprintf(out,
++                    "{\"backend\":\"rive_native_vulkan\",\"elements\":%d,"
++                    "\"frames\":%d,\"warmup\":%d,\"fb\":[%d,%d],"
++                    "\"frame_ms\":{\"mean\":%f,\"p50\":%f,\"p95\":%f,"
++                    "\"p99\":%f,\"min\":%f,\"max\":%f}}\n",
++                    g_benchElements,
++                    kFrames,
++                    kWarmup,
++                    width,
++                    height,
++                    mean,
++                    pct(50),
++                    pct(95),
++                    pct(99),
++                    sorted.front(),
++                    sorted.back());
++            fclose(out);
++        }
++        elements.clear();
++        glfwSetWindowShouldClose(window, 1);
++    }
++}
++} // namespace pfbench
++// ---------------------------------------------------------------------------
++
+ static void update_window_title(double fps,
+                                 int instances,
+                                 int width,
+@@ -985,6 +1300,10 @@ void riveMainLoop()
+         }
+         renderer->restore();
+     }
++    else if (g_benchElements)
++    {
++        pfbench::frame(fiddleContext->factory(), renderer.get(), width, height);
++    }
+     else
+     {
+         float2 p[9];
+diff --git a/renderer/premake5.lua b/renderer/premake5.lua
+index 8de40306..d6b35811 100644
+--- a/renderer/premake5.lua
++++ b/renderer/premake5.lua
+@@ -94,7 +94,10 @@ if not _OPTIONS['with-webgpu'] then
+         do
+             architecture('x64')
+             defines({ 'RIVE_WINDOWS', '_CRT_SECURE_NO_WARNINGS' })
+-            links({ 'glfw3', 'opengl32', 'd3d11', 'd3d12', 'dxguid', 'dxgi', 'd3dcompiler'})
++            links({ 'glfw3', 'opengl32', 'd3d11', 'd3d12', 'dxguid', 'dxgi', 'd3dcompiler',
++                    -- local patch: system libs GLFW needs, missing from the
++                    -- clang/lld (non-msbuild) link line
++                    'user32', 'gdi32', 'shell32', 'advapi32', 'ole32', 'winmm' })
+         end
+         if _OPTIONS['with_optick'] then
+             links({'optick'})

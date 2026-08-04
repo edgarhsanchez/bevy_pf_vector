@@ -1,0 +1,1 @@
+{"backend":"rive_native_vulkan","elements":200,"frames":600,"warmup":120,"fb":[2560,1440],"frame_ms":{"mean":0.223540,"p50":0.204100,"p95":0.325900,"p99":0.760800,"min":0.098800,"max":1.226400}}

@@ -89,9 +89,20 @@ from any reference renderer:
   ~100x @200, ~11x @5000. Vello's ~0.8 ms floor is canvas-sized compute —
   the per-frame cost thesis, measured. Screenshot-verified identical
   workload (`--backend vello --screenshot`).
-- Native Rive Renderer: NOT measurable in-process (rive-bevy pins old Bevy
-  and renders via vello anyway; native renderer would need a standalone
-  harness — the in-engine interop path was removed by the purity decision).
+- Native Rive Renderer (C++): MEASURED via a standalone harness — built
+  rive-runtime at the pinned SHA on Windows (clang/lld + ninja via their
+  build_rive.sh under Git Bash + vcvars + Vulkan SDK; premake needs vswhere
+  on PATH and GLFW needs user32/gdi32/shell32 added for the lld link line),
+  with `benchmarks/rive-native-bench.patch` adding a --bench N mode to
+  path_fiddle that ports the harness workload generator exactly (same
+  SplitMix64 stream). Vulkan interlock fast path active, 2560x1440,
+  IMMEDIATE present. Results: 0.204 ms/frame @200 el, 1.716 ms @5000 el
+  (render-only loop). Engine renderer cost ~0.015/~0.19 ms → ~10x faster
+  at both scales. Fallback modes verified to exist in source
+  (InterlockMode{rasterOrdering, atomics, clockwise, clockwiseAtomic,
+  msaa}, renderer/include/rive/renderer/gpu.hpp:743) — closes the old
+  "unverified claims" item. Vendor tree is gitignored; the patch file is
+  the reproducibility artifact.
 - Skia / Pathfinder: unmeasured, would need standalone harnesses.
 
 ## Next tasks
