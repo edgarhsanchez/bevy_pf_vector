@@ -788,6 +788,60 @@ way today: measure the CURVE not one point; verify in the real app, not a
 settled screenshot; and a feature that is not faster IN THE GAME does not
 ship, however good the microbenchmark.
 
+## WHY THE BENCHMARKS LIED (2026-08-05) — read before trusting any number here
+
+The GPU shape backend measured 2.89x FASTER than CPU rasterization in the
+harness and ran 2.4x SLOWER in the actual game (16-18 ms/frame vs 6.3-7.3).
+A 7x swing between benchmark and reality. The benchmark was not slightly
+optimistic; it was measuring a different question. Every flaw below is a
+methodology error, not bad luck.
+
+1. **Wrong workload size.** Benchmarked 200-5000 shapes. A real XAML screen
+   has TENS. My own table showed CPU winning at 200 — the regime the game
+   is actually in — and I quoted the 5000 number anyway. That is motivated
+   reasoning: I chose the point where my design won.
+
+2. **Wrong workload character.** Benchmarked every shape ANIMATING every
+   frame. Real UI is overwhelmingly static, which is precisely the case the
+   CPU path already caches to zero cost. I benchmarked the case my design
+   was good at instead of the case the product has.
+
+3. **Measured in an empty app.** The harness draws shapes and nothing else.
+   A fixed per-frame cost (extra camera, extra pass, 2048x2048 clear) is
+   invisible when it is the only thing running and decisive when it
+   competes with a game loop, 3D scene and post-processing.
+
+4. **Never benchmarked the integration until after shipping it.** Every
+   number was about the ENGINE on synthetic content. The one measurement
+   that mattered — game FPS with the feature on vs off — took ten minutes
+   and I ran it only after the user reported the problem. It should have
+   been the first measurement, not the last.
+
+5. **Percentiles over a settled window hid the churn.** p50 over 600 frames
+   after a 120-frame warmup EXCLUDES BY CONSTRUCTION the mount, resize and
+   atlas-rebuild churn that produced the blinking. The metric could not see
+   the actual bug.
+
+6. **The engine suite had the same blind spot.** The epoch-flush bug
+   (20x at 200k) survived the entire project because every tier sat under
+   the 8192 threshold. A suite that only ever tests where the design is
+   comfortable validates the design instead of testing it.
+
+### The rule that replaces all of this
+
+THE REAL APPLICATION IS THE BENCHMARK. Microbenchmarks diagnose WHY
+something is slow; they never establish that something is fast.
+
+- Primary metric: A/B frame time in friginrain2, feature on vs off, same
+  build, same scene. `FRIGINRAIN2_LOG_FPS=1` prints it every two seconds.
+- No renderer claim ships without that A/B. Not one.
+- Report the CURVE across the standard tiers, never a single point, and
+  never the flattering point.
+- Include the transient frames — mount, resize, remount. If a metric
+  cannot see blinking, it is the wrong metric.
+- State the regime a result holds in ("above ~1000 shapes"), because
+  outside it the result is usually reversed.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
