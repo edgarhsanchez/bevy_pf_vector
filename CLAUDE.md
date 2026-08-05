@@ -871,6 +871,49 @@ something is slow; they never establish that something is fast.
 - State the regime a result holds in ("above ~1000 shapes"), because
   outside it the result is usually reversed.
 
+## THE SUITE WAS SILENTLY BROKEN (2026-08-05)
+
+`run-suite.ps1` ran all five tiers, printed its tier headers, and exited 0 --
+while `cargo run -p benchmarks` had not compiled for some time. Adding the SDF
+`VectorPrimitive::Rect` variant turned an irrefutable `let` in
+`benchmarks/src/main.rs:243` (`let VectorPrimitive::Arc { sweep, .. } = ..`)
+into a refutable one, so the crate stopped building. Nobody noticed because
+the script piped `2>&1` straight into `Select-String`: anything not matching
+the metric patterns was DISCARDED, compile errors included, and a suite that
+could not build looked exactly like a clean run.
+
+Fixed both: `let ... else { continue }` in the harness, and the script now
+captures output first, checks `$LASTEXITCODE`, and throws when a tier produces
+no metrics -- printing the real output when it does.
+
+Same family as "WHY THE BENCHMARKS LIED": a metric that cannot see the failure
+mode is the wrong metric. Here the reporting layer could not represent
+"failed" at all.
+
+## Standard suite, re-measured after the fix (2026-08-05)
+
+Engine, RTX A6000 / Vulkan, 600 frames (180 at 1M), p50:
+
+| tier      | vector_pass GPU | frame  | GPU ns/element |
+|-----------|-----------------|--------|----------------|
+| 200       | 0.0123 ms       | 0.705  | 61.5 |
+| 1,000     | 0.0440          | 0.771  | 44.0 |
+| 5,000     | 0.1894          | 1.090  | 37.9 |
+| 50,000    | 2.2272          | 7.211  | 44.5 |
+| 1,000,000 | 57.01           | 266.3  | 57.0 |
+
+No regression: 5,000 reproduces the recorded 0.1894 exactly, and 200 came in
+slightly better than the 0.0133 on record. 1M frame time improved (266 vs 289)
+while its GPU went the other way (57.0 vs 52.9); note p99 GPU at 1M is 97.4 ms
+against a 57.0 p50, so that tier carries real variance and a single number
+should not be quoted from it.
+
+The shape of the curve is unchanged and still says the same thing: GPU cost
+per element is roughly FLAT (38-62 ns across four orders of magnitude), while
+at 1M the frame is 266 ms against 57 ms of GPU -- ~209 ms of CPU, ~0.21
+us/element. `extract_shapes` remains the wall, exactly as the profile said,
+and G1 (GPU-driven instance pipeline) remains the change that attacks it.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%

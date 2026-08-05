@@ -37,10 +37,23 @@ foreach ($backend in $Backends) {
         Write-Host "== $backend / $tier elements ==" -ForegroundColor Cyan
         Push-Location $root
         try {
-            & cargo run --release -p benchmarks -- `
+            # Capture first, filter second. Piping straight into Select-String
+            # discards everything that does not match -- including compile
+            # errors and panics -- so a suite that could not build printed
+            # nothing but its own tier headers and exited 0. That is exactly
+            # what a clean run looks like. It hid a broken benchmark build for
+            # as long as it took someone to run a tier by hand.
+            $out = & cargo run --release -p benchmarks -- `
                 --backend $backend --elements $tier `
-                --frames $frames --warmup $warmup 2>&1 |
-                Select-String "^cpu_frame_ms|^render/vector_pass/elapsed_gpu|^=="
+                --frames $frames --warmup $warmup 2>&1
+            $failed = $LASTEXITCODE -ne 0
+            $metrics = $out | Select-String "^cpu_frame_ms|^render/vector_pass/elapsed_gpu"
+            if ($failed -or -not $metrics) {
+                Write-Host "-- FAILED ($backend / $tier): exit $LASTEXITCODE, no metrics --" -ForegroundColor Red
+                $out | ForEach-Object { Write-Host "   $_" }
+                throw "benchmark run failed: $backend / $tier elements"
+            }
+            $metrics
         } finally {
             Pop-Location
         }

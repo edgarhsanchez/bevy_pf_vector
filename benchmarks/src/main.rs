@@ -240,7 +240,12 @@ fn animate_arcs_param(
 ) {
     let t = frame.0 as f32 / 120.0;
     for (anim, mut primitive) in &mut query {
-        let bevy_pf_vector::VectorPrimitive::Arc { sweep, .. } = &mut *primitive;
+        // Only arcs have a sweep. `VectorPrimitive` grew an SDF `Rect`
+        // variant, so this can no longer be an irrefutable binding; workload 2
+        // spawns arcs exclusively, and anything else is left alone.
+        let bevy_pf_vector::VectorPrimitive::Arc { sweep, .. } = &mut *primitive else {
+            continue;
+        };
         *sweep = arc_sweep(t, anim.speed, anim.phase);
     }
 }
