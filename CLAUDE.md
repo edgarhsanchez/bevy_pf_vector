@@ -718,6 +718,76 @@ handles the arbitrary-path remainder faster than our atlas did. P1-P4 are
 the plan IF bevy_pf grows XAML Clip/Opacity/ImageBrush on shapes. Decide
 that first.
 
+## PUSHING THE BAR — the GPU-driven roadmap (2026-08-05)
+
+Grounded in what this hardware actually reports, not the spec. Run
+`cargo run --release -p benchmarks --example gpu_caps` to re-check on any
+machine. RTX A6000 / Vulkan / wgpu 29 has ALL of:
+MULTI_DRAW_INDIRECT_COUNT, SUBGROUP + SUBGROUP_VERTEX,
+DUAL_SOURCE_BLENDING, TEXTURE_BINDING_ARRAY + PARTIALLY_BOUND_BINDING_ARRAY,
+SHADER_INT64_ATOMIC_ALL_OPS, TEXTURE_ATOMIC, SHADER_FLOAT32_ATOMIC,
+EXPERIMENTAL_MESH_SHADER. 2 GB storage buffers, 1024-wide workgroups.
+
+The 1M tier says exactly where the ceiling is: **GPU 33 ms, CPU ~236 ms.**
+The renderer is not the limit. Per-element CPU work is. Everything below
+attacks that, in priority order.
+
+### G1 — GPU-driven instance pipeline (the big one)
+
+Today extract -> sort -> batch -> upload runs on the CPU, per element,
+every frame (~0.24 us/element). Replace with:
+  1. PERSISTENT instance buffer + change-detection upload (deltas only,
+     not the whole set). Already listed as "future" in Next tasks; it is
+     the precondition.
+  2. A COMPUTE pass doing cull + depth sort + draw-arg generation, using
+     SUBGROUP prefix sums for the sort.
+  3. `multi_draw_indirect_count` so the GPU decides the draw count and the
+     CPU issues ONE call regardless of element count.
+Result: per-frame CPU approaches constant, independent of element count.
+1M elements becomes GPU-bound at ~33 ms rather than 289 ms.
+This is the genuinely novel part: compute-driven RASTERIZATION is well
+trodden (Vello), but GPU-driven INSTANCE MANAGEMENT for retained vector UI
+is not something current 2D renderers do.
+
+### G2 — Advanced blend in ONE pass via dual-source blending
+
+ThorVG and Rive both need an intermediate target (or interlock) for blend
+modes. DUAL_SOURCE_BLENDING lets the fragment shader emit a second colour
+used as a blend factor, which covers a useful subset of the 16 modes with
+no extra pass or target. Separable modes first; hue/saturation/colour/
+luminosity still need a real destination read, so those fall back to the
+compositor from the plan above. Strictly better than either reference on
+the modes it covers.
+
+### G3 — Bindless image brushes
+
+TEXTURE_BINDING_ARRAY + PARTIALLY_BOUND_BINDING_ARRAY means every image
+lives in one binding array indexed per instance. Most 2D renderers break
+their batch on a texture change; we would not break at all. Closes the
+ImageBrush gap AND does it better than the references.
+
+### G4 — Atomics-mode order independence
+
+With SHADER_INT64_ATOMIC_ALL_OPS and TEXTURE_ATOMIC, Rive's `atomics`
+InterlockMode is implementable here — order-independent coverage without
+fragment shader interlock. This is the escape hatch from the whole
+"wgpu cannot do interlock" constraint that shaped ARCHITECTURE.md 2.
+
+### G5 — Mesh shaders (experimental)
+
+EXPERIMENTAL_MESH_SHADER could generate stroke expansion and fan geometry
+on the GPU, removing vertex buffers for parametric content entirely.
+Experimental in wgpu and NVIDIA-only in practice today — prototype only,
+never the default path.
+
+### Discipline this time
+
+Every one of G1-G5 is a measurable claim on the standard suite
+(`benchmarks/run-suite.ps1`, tiers to 1M). Rules, learned the expensive
+way today: measure the CURVE not one point; verify in the real app, not a
+settled screenshot; and a feature that is not faster IN THE GAME does not
+ship, however good the microbenchmark.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
