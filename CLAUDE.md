@@ -827,6 +827,18 @@ methodology error, not bad luck.
    the 8192 threshold. A suite that only ever tests where the design is
    comfortable validates the design instead of testing it.
 
+7. **And the in-game A/B is itself confounded.** Running the SAME baseline
+   config twice gave 136-159 fps and 56-71 fps. Same build, same flags. The
+   earlier log starts near 58 and jumps to ~150 partway through, so frame
+   rate depends on WHICH SCREEN is up — login vs hub vs in-world. Comparing
+   two runs that were on different screens compares scenes, not renderers.
+   The 2.4x regression figure is therefore directional only; the user's
+   independent 20-vs-100+ observation is what corroborates it.
+
+   A trustworthy A/B needs a FIXED scene: boot to a named screen, wait for
+   it to settle, sample a fixed window, exit. Until that exists, treat every
+   in-game number in this file as indicative rather than measured.
+
 ### The rule that replaces all of this
 
 THE REAL APPLICATION IS THE BENCHMARK. Microbenchmarks diagnose WHY
