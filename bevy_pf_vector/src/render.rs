@@ -64,6 +64,20 @@ pub struct VectorRenderPlugin;
 
 impl Plugin for VectorRenderPlugin {
     fn build(&self, app: &mut App) {
+        // Degrade instead of panicking when there is no renderer. A headless
+        // App (MinimalPlugins, or any integration test that exercises UI logic
+        // without a GPU) has no `Assets<Shader>`, and `load_internal_asset!`
+        // unwraps it -- so merely ADDING this plugin took the process down.
+        // That made bevy_pf's `vector_gpu` feature untestable headlessly: it
+        // pulls in this plugin, so `cargo test --features vector_gpu` failed
+        // in a test that never drew anything.
+        //
+        // Nothing below can function without a render app anyway, so skipping
+        // is the honest behaviour; drawing is simply absent, as it already is
+        // for every other renderer in a headless app.
+        if !app.world().contains_resource::<Assets<Shader>>() {
+            return;
+        }
         load_internal_asset!(app, VECTOR_SHADER_HANDLE, "vector.wgsl", Shader::from_wgsl);
         load_internal_asset!(
             app,
