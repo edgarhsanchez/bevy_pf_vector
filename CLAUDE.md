@@ -655,6 +655,69 @@ constraints as us, has the features we lack), Blend2D second (why CPU
 rasterization keeps winning at UI sizes), Vello third (compute approach we
 rejected, but its clipping strategy is instructive).
 
+## STUDY RESULT + IMPLEMENTATION PLAN (2026-08-05)
+
+Read ThorVG's WebGPU backend (src/renderer/gpu_engine/wg, via `gh api`).
+It is the reference that matters because it runs under OUR constraints —
+WebGPU, no fragment shader interlock — and it ships the features we lack.
+
+Two findings that settle open questions:
+
+1. **ThorVG TESSELLATES on WebGPU** (`tvgWgTessellator`). It is not a
+   compute renderer. Our tessellate-and-instance architecture is a
+   legitimate WebGPU design, not a compromise. Vello's compute approach is
+   one valid option, not the only modern one.
+2. **The features we lack come from a COMPOSITOR, not from exotic GPU
+   features.** `tvgWgCompositor` holds: a depth/STENCIL texture (plus an
+   MSAA variant), two intermediate render targets (`targetTemp0/1`), a
+   pool of 256 opacity buffers, and a blit mesh. `WgCompose` carries
+   `BlendMethod`, an aabb, composition flags, and `masked` (set when a
+   composition needs more than one target).
+
+So the trick for "read the destination", which WebGPU forbids via
+framebuffer fetch, is simply: render the group to an INTERMEDIATE TARGET,
+then composite it back in a pass that samples that target AS A TEXTURE and
+applies the blend function in the fragment shader. Stencil handles fill
+rules and clip regions. Nothing here needs an extension.
+
+Cost is one extra target + pass PER COMPOSITING GROUP, and only when a
+group actually needs it. Simple content stays single-pass — which is what
+our engine already is, so this extends rather than replaces it.
+
+### Plan, in dependency order
+
+Each phase is independently useful and independently measurable. Do not
+start a phase before the previous one is verified IN THE GAME, not just in
+a screenshot — that error cost this project three regressions.
+
+- **P1 — Compositing groups.** A `VectorLayer` component marking a subtree
+  that renders to an intermediate target and composites back with an
+  opacity. Allocate a target ONLY when opacity < 1, blend != srcOver, or a
+  mask is present; otherwise draw inline as today. Unlocks XAML `Opacity`
+  on containers. Verify: nested opacity groups look right and cost nothing
+  when unused.
+- **P2 — Stencil clipping.** Add a stencil aspect to the existing depth
+  attachment; render clip geometry to stencil, draw content with a stencil
+  test. Replaces the analytic SDF clip's 4-deep rounded-rect/circle limit
+  with arbitrary paths and real nesting. Keep the SDF path for the simple
+  case — it needs no extra pass and is measurably cheap.
+- **P3 — Advanced blend modes.** With P1 in place this is a fragment
+  function in the composite shader over the 16 modes. Follow Rive's uber
+  shader with feature bits so content that does not blend pays nothing.
+- **P4 — Image fills.** `Brush::Image` plus a texture binding; XAML
+  `ImageBrush` is common and this is the smallest remaining gap.
+- **P5 — Feather/blur.** Separable blur on a P1 target, or an SDF feather
+  for primitives. Lowest priority; nothing in bevy_pf asks for it yet.
+
+### The prior question
+
+None of this is worth starting until bevy_pf actually needs it. Today it
+does not: the measured result is that bevy_ui's own node rendering handles
+rounded boxes, borders and gradients on the GPU for free, and tiny-skia
+handles the arbitrary-path remainder faster than our atlas did. P1-P4 are
+the plan IF bevy_pf grows XAML Clip/Opacity/ImageBrush on shapes. Decide
+that first.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
