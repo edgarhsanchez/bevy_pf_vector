@@ -839,6 +839,23 @@ methodology error, not bad luck.
    it to settle, sample a fixed window, exit. Until that exists, treat every
    in-game number in this file as indicative rather than measured.
 
+8. **And I bypassed the project's own tooling.** friginrain2 has
+   `scripts/run_app.ps1` (and `run_client_prod_db.ps1` wrapping it) as the
+   canonical launcher. Running `friginrain_client.exe` directly — which I did
+   for every debug test and repro — skips `WGPU_BACKEND=dx12` (production is
+   dx12; direct launches got Vulkan), the SpacetimeDB env, and asset-root
+   handling. So those runs measured a different backend than the game ships.
+
+   Worse, `run_app.ps1 -Profiling` exists precisely for this: "release-grade
+   optimization with debug symbols and thin LTO — representative performance
+   but builds far faster than fat-LTO --release". Every A/B in this file was
+   run on a DEBUG build instead. `run_bench.ps1`,
+   `tracy_capture_and_export.ps1` and `export_tracy_logs.ps1` were also
+   already there; I reimplemented chrome tracing rather than looking.
+
+   Use the scripts. Measure with `-Profiling`, ship-verify with `-Release`,
+   and never launch the binary directly.
+
 ### The rule that replaces all of this
 
 THE REAL APPLICATION IS THE BENCHMARK. Microbenchmarks diagnose WHY
