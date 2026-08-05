@@ -944,6 +944,45 @@ bevy_pf/friginrain2 rather than this suite -- untested against these tiers.
 Expected to stay flat for the same reason it did there: these loops are
 allocation, hashing and ECS iteration, not float math.
 
+## THE ATLAS CLEAR IS THE FIXED COST -- measured, NOT landed (2026-08-05)
+
+The reason the bevy_pf GPU backend loses at UI scale is the per-frame
+2048x2048 clear, not rasterization. Confirmed by shrinking it:
+
+| 200 shapes, 56x40, animated  | frame p50 |
+|------------------------------|-----------|
+| CPU (tiny-skia)              | 0.885 ms  |
+| GPU, ATLAS_SIZE 2048         | 0.973     |
+| GPU, ATLAS_SIZE 1024         | **0.872** |
+
+Quartering the atlas area saved 0.101 ms and flipped the result: the GPU path
+BEATS the CPU path at the scale a real XAML screen occupies. The saving
+matches the bandwidth arithmetic (2048^2 x 4B = 16.7 MB/frame ~ 0.17 ms),
+which is what makes the clear the credible culprit rather than a coincidence.
+
+So the standing conclusion in this file -- "the GPU backend does not beat CPU
+on UI workloads" -- is true of the CURRENT implementation and NOT a property
+of the design. It loses on fixed overhead it does not need to pay.
+
+NOT LANDED, deliberately. A fixed smaller atlas overflows for large shapes:
+at 1024, a 300x220 panel rounds to 304x224, giving ~12 slots, and the
+documented 24-panel workload needs 24. Overflow hits `rebuild_atlas_if_full`,
+which drops EVERY reservation so the next frame re-registers all of them --
+per frame, forever. That workload measured 0.887 ms at 1024 (against 0.959 at
+2048), i.e. it looked FASTER while it was either thrashing or silently
+falling back to CPU for half its shapes. Frame-time percentiles cannot tell
+those apart; the last time this thrash shipped it was visible as BLINKING and
+the metric never saw it.
+
+The real fix is a content-sized atlas that GROWS on overflow instead of
+resetting: start small (256-512), double up to 2048, recreating image, layout
+and camera projection on growth. `ATLAS_SIZE` is a const used in 8 places
+including the camera projection and the half-extent offset, so this is a real
+change, and it must be verified with `shapes_gpu_check` exercising shapes
+ACROSS FRAMES with resize and remount -- not one settled screenshot.
+
+Only then is `vector_gpu` worth re-evaluating.
+
 ## WHERE THE ENGINE IS ACTUALLY USED (verified 2026-08-05)
 
 This has flipped more than once and the manifests have carried comments that
