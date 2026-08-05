@@ -2,6 +2,17 @@
 resolver = "2"
 members = ["bevy_pf_vector", "benchmarks"]
 
+# Match friginrain2's release profile, which is where this engine actually
+# ships. Without this the suite measured the engine at cargo's defaults --
+# lto = false, codegen-units = 16 -- while production built it with fat LTO
+# and a single codegen unit. Benchmarking a weaker build than the one that
+# ships is the same class of error as benchmarking a different workload.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 # Bevy is unusably slow at opt-level 0; benchmarks must use --release regardless.
 [profile.dev]
 opt-level = 1

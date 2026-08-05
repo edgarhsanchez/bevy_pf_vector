@@ -892,27 +892,51 @@ mode is the wrong metric. Here the reporting layer could not represent
 
 ## Standard suite, re-measured after the fix (2026-08-05)
 
-Engine, RTX A6000 / Vulkan, 600 frames (180 at 1M), p50:
+FIRST: the suite was building with cargo's DEFAULT release profile -- no LTO,
+codegen-units 16 -- while friginrain2, where this engine actually ships,
+builds it with `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`. The
+engine was being measured in a weaker build than the one that ships. The
+workspace now carries a `[profile.release]` matching production.
+
+Engine, RTX A6000 / Vulkan, 600 frames (180 at 1M), p50, production profile:
 
 | tier      | vector_pass GPU | frame  | GPU ns/element |
 |-----------|-----------------|--------|----------------|
-| 200       | 0.0123 ms       | 0.705  | 61.5 |
-| 1,000     | 0.0440          | 0.771  | 44.0 |
-| 5,000     | 0.1894          | 1.090  | 37.9 |
-| 50,000    | 2.2272          | 7.211  | 44.5 |
-| 1,000,000 | 57.01           | 266.3  | 57.0 |
+| 200       | 0.0123 ms       | 0.653  | 61.5 |
+| 1,000     | 0.0430          | 0.727  | 43.0 |
+| 5,000     | 0.1792          | 0.973  | 35.8 |
+| 50,000    | 2.2292          | 7.511  | 44.6 |
+| 1,000,000 | 50.49           | 260.4  | 50.5 |
 
-No regression: 5,000 reproduces the recorded 0.1894 exactly, and 200 came in
-slightly better than the 0.0133 on record. 1M frame time improved (266 vs 289)
-while its GPU went the other way (57.0 vs 52.9); note p99 GPU at 1M is 97.4 ms
-against a 57.0 p50, so that tier carries real variance and a single number
-should not be quoted from it.
+What fat LTO actually bought, measured twice per configuration:
 
-The shape of the curve is unchanged and still says the same thing: GPU cost
-per element is roughly FLAT (38-62 ns across four orders of magnitude), while
-at 1M the frame is 266 ms against 57 ms of GPU -- ~209 ms of CPU, ~0.21
-us/element. `extract_shapes` remains the wall, exactly as the profile said,
-and G1 (GPU-driven instance pipeline) remains the change that attacks it.
+| tier  | metric | default (x2)     | fat LTO (x2)    | verdict          |
+|-------|--------|------------------|-----------------|------------------|
+| 5,000 | frame  | 1.090 / 1.064    | 0.973 / 0.979   | -9.4%, REAL      |
+| 5,000 | GPU    | 0.1894 / 0.1792  | 0.1792 / 0.1802 | unchanged        |
+| 1M    | frame  | 266.3 / 264.8    | 260.4 / 264.3   | -1.2%, in noise  |
+| 1M    | GPU    | 57.01 / 50.05    | 50.49 / 50.47   | unchanged        |
+
+So: ~5-10% of FRAME time at HUD-scale tiers (200/1k/5k all moved together),
+nothing at 1M where per-element extract work swamps it, and nothing on the
+GPU -- which is the expected result for a host codegen flag and a useful
+sanity check that the harness is measuring what it claims.
+
+NOISE FLOOR, measured by re-running the SAME binary: GPU p50 is stable to
+<1%; frame p50 varies up to 3.4% at 50k. Anything smaller than that is not a
+result.
+
+CORRECTION worth keeping: the first 1M run reported 57.01 ms GPU and was
+briefly read as LTO improving GPU time by 11%. It was an OUTLIER -- its p99
+was 97.4 ms against ~59 ms on every run since, and re-measuring the default
+profile gave 50.05. A host build flag cannot move GPU execution time; the
+number that suggested it did was a disturbed run. Two runs per configuration
+is the minimum here, and the 1M tier needs it most.
+
+`-C target-cpu=native` was measured as no-improvement previously, but in
+bevy_pf/friginrain2 rather than this suite -- untested against these tiers.
+Expected to stay flat for the same reason it did there: these loops are
+allocation, hashing and ECS iteration, not float math.
 
 ## Next tasks
 
