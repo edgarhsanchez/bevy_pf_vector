@@ -464,8 +464,14 @@ DONE since:
   and its shared theme drawing layer now paint through the engine.
 - hud_component_lab's last three widgets and its demo runner ported;
   legacy `shapes.rs` stripped to painter-free helpers.
-- **`bevy_vector_shapes` is removed from every manifest.** The client has
-  ONE 2D vector renderer. Builds and boots clean.
+- `bevy_vector_shapes` was removed from every manifest at the time. **That is
+  no longer true (verified 2026-08-05): it is back**, imported by
+  src/runtime.rs, tool_workspace.rs, ui/mod.rs and ui/screen.rs, because
+  friginrain_hud draws the in-world HUD with it. That is the deliberate
+  outcome of "THE LIMIT OF TESSELLATE-ONCE" below, not a regression -- an
+  immediate-mode HUD whose primitives change size every frame is the worst
+  case for this engine and the native case for SDF. The client runs TWO 2D
+  vector renderers on purpose.
 
 The port was a type swap, not a rewrite, because the engine grew a
 STATEFUL painter mode (set_translation/set_rotation/color/hollow/thickness
@@ -937,6 +943,44 @@ is the minimum here, and the 1M tier needs it most.
 bevy_pf/friginrain2 rather than this suite -- untested against these tiers.
 Expected to stay flat for the same reason it did there: these loops are
 allocation, hashing and ECS iteration, not float math.
+
+## WHERE THE ENGINE IS ACTUALLY USED (verified 2026-08-05)
+
+This has flipped more than once and the manifests have carried comments that
+contradicted the build, so verify rather than read. The check is one command:
+
+    cargo tree -i bevy_pf_vector      # run in friginrain2
+
+Today it answers: friginrain2 and hud_component_lab. **bevy_pf is NOT among
+them.**
+
+| consumer            | uses the engine?                                  |
+|---------------------|---------------------------------------------------|
+| friginrain2 (direct)| YES -- `PfVectorPlugin` in runtime.rs:138 and     |
+|                     | game_view/mod.rs:132; VectorPainter for           |
+|                     | tool_workspace's node graph and wires             |
+| hud_component_lab   | YES -- button/card/progress paint through it      |
+| bevy_pf (XAML shapes)| NO -- `vector_gpu` is off, so `<Rectangle>`,     |
+|                     | `<Ellipse>`, `<Path>` still rasterize on the CPU  |
+|                     | with tiny-skia into per-shape `Image` assets      |
+| friginrain_hud      | NO -- back on bevy_vector_shapes (SDF), on purpose|
+
+So the engine reaches the game DIRECTLY, and does not reach it through
+bevy_pf at all. Since friginrain2's UI is essentially all XAML now, most of
+what is on screen is NOT drawn by this engine.
+
+The bevy_pf integration is written and works (`vector_gpu`,
+crates/bevy_pf/src/shapes_gpu.rs, correctness-checked by
+examples/shapes_gpu_check.rs); it is switched off because it lost at UI
+scale. The crossover is ~1000 shapes and a XAML screen has tens. The Cargo
+comment in friginrain2 claimed it was ON, citing 2.89x at 5000 animated
+shapes -- a real number for a workload the product does not have. Corrected
+2026-08-05.
+
+What would change the answer: making the atlas backend cheap at LOW shape
+counts (clear only live slots rather than the whole 2048^2, size the atlas to
+content, split path from paint so a colour edit rebuilds neither), since the
+fixed per-frame overhead -- not rasterization -- is what loses at that scale.
 
 ## Next tasks
 
