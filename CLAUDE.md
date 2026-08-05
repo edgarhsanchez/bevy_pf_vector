@@ -565,6 +565,62 @@ HUD can animate size every frame at one instance write per shape, and
 Do NOT re-attempt that port before these land — the failure was structural,
 not incidental.
 
+## CAPABILITY AUDIT vs RIVE (2026-08-05) — we are NOT feature-complete
+
+Read from the vendored rive-runtime (benchmarks/vendor/rive-runtime,
+gitignored): `include/rive/renderer.hpp` for the API surface,
+`renderer/include/rive/renderer/gpu.hpp` for ShaderFeatures and
+InterlockMode. This is the honest gap list, not a benchmark.
+
+| capability                    | Rive | ours |
+|-------------------------------|------|------|
+| fill rules (nonzero/evenodd)  | yes  | yes  |
+| stroke join/cap/miter         | yes  | yes  |
+| dash patterns                 | yes  | yes  |
+| linear + radial gradients     | yes  | yes  |
+| ARBITRARY PATH CLIPPING       | yes  | NO — rounded-rect/circle, 4 deep |
+| nested clipping               | yes  | partial (same 4 deep) |
+| ADVANCED BLEND MODES (16)     | yes  | NO — srcOver only |
+| FEATHER / blur                | yes  | NO   |
+| IMAGE FILLS + image meshes    | yes  | NO   |
+| save/restore + layer opacity  | yes  | NO   |
+| dither                        | yes  | NO   |
+
+For bevy_pf specifically, four of those are not exotic — XAML uses them:
+`Clip` takes arbitrary geometry, `Opacity` on a container is a layer
+(save/restore) group, `ImageBrush` is an image fill, and effects want blend
+modes. Our engine cannot express any of them today.
+
+WHY, architecturally — this is the important part. Advanced blend and
+correct arbitrary clipping need to READ the destination while drawing.
+Rive offers five strategies for that (`InterlockMode`):
+
+- `rasterOrdering` — fragment shader interlock. Fastest. Not exposed by
+  wgpu, which is the constraint ARCHITECTURE.md 2 was built around.
+- `atomics` — portable via atomics, no barriers.
+- `clockwise` / `clockwiseAtomic` — override every fill rule with a
+  clockwise rule; experimental.
+- `msaa` — MSAA + stencil. **This one IS expressible in wgpu.**
+
+So the path to feature parity is not an optimisation, it is adopting a
+strategy: either an atomics-based or an MSAA+stencil pass structure. Our
+current design (single pass, alpha blend, analytic SDF clip) is a
+deliberate subset and cannot be extended to these features by tuning.
+
+Rive also uses an UBER SHADER with `ShaderFeatures` bits
+(ENABLE_CLIPPING, ENABLE_CLIP_RECT, ENABLE_ADVANCED_BLEND, ENABLE_FEATHER,
+ENABLE_EVEN_ODD, ENABLE_NESTED_CLIPPING, ENABLE_HSL_BLEND_MODES,
+ENABLE_DITHER) compiled per batch, so simple content pays nothing for
+features it does not use. We compile pipeline variants per (format, msaa,
+opaque) only — worth copying if the feature set grows.
+
+RECOMMENDATION: do not bolt these on one at a time. Decide first whether
+bevy_pf actually needs XAML Clip/Opacity/ImageBrush; if it does, the
+honest options are (a) adopt Rive's msaa+stencil structure for correctness,
+or (b) keep this engine as the fast subset renderer and let bevy_ui/another
+renderer own the general case — which is what the last three attempts
+concluded empirically anyway.
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
