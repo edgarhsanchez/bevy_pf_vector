@@ -621,6 +621,40 @@ or (b) keep this engine as the fast subset renderer and let bevy_ui/another
 renderer own the general case — which is what the last three attempts
 concluded empirically anyway.
 
+## OTHER RENDERERS WORTH STUDYING (2026-08-05)
+
+Rive is not the only reference, and two of these matter more to our
+constraints than Rive does.
+
+- **ThorVG 1.0** (C++, released 2026, SVG + Lottie) ships a **WebGPU
+  backend**. That is the single most relevant codebase to this project:
+  WebGPU is the same capability envelope wgpu gives us, so whatever ThorVG
+  does for arbitrary clipping, blend modes and layer opacity is a
+  DEMONSTRATION that those are achievable without fragment shader
+  interlock. Rive's fast path needs an extension wgpu does not expose;
+  ThorVG's does not. Read this before choosing a strategy from the Rive
+  audit above. https://github.com/thorvg/thorvg
+- **Blend2D** (C++, JIT-compiled CPU rasterizer) is reported to still beat
+  GPU renderers including Skia and Vello on many benchmarks. That is a
+  direct, independent confirmation of what we measured the hard way: a good
+  CPU rasterizer is extremely competitive for UI-sized content, and
+  tiny-skia beating our atlas backend 2.4x in-game was not an anomaly.
+  https://blend2d.com/about.html
+- **Vello** (Rust, wgpu) — GPU compute-centric, uses prefix-scan to
+  parallelise sorting/clipping that normally needs CPU or intermediate
+  textures. Already vendored as a benchmark opponent. Note `vello-cpu`
+  beats Skia and Cairo on CPU, and Vello's GPU advantage is much larger on
+  Apple Silicon than on a desktop iGPU — worth remembering before quoting
+  any single-machine number.
+  https://github.com/linebender/vello
+- **Skia** — the general-purpose baseline; still unmeasured here.
+- Reference list: https://github.com/zhanba/awesome-2d-graphics-rendering
+
+Order of study for the next person: ThorVG's WebGPU backend first (same
+constraints as us, has the features we lack), Blend2D second (why CPU
+rasterization keeps winning at UI sizes), Vello third (compute approach we
+rejected, but its clipping strategy is instructive).
+
 ## Next tasks
 
 - DONE: HudTransform (flat, hierarchy-free; --flat in benchmarks; ~3%
